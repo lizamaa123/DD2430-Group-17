@@ -1,0 +1,14 @@
+# Environments
+.env
+venv/
+__pycache__/
+
+# Data (never push generated datasets to GitHub)
+data/
+*.csv
+*.json
+
+# PyTorch & Jupyter
+*.pt
+*.pth
+.ipynb_checkpoints/
