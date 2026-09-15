@@ -15,15 +15,11 @@ import random
 import pandas as pd
 import json
 
-# ---------------------------------------------------------------------------
 # 0. Load metadata
-# ---------------------------------------------------------------------------
 METADATA_PATH = "data/processed_ikea_data.csv"
 df = pd.read_csv(METADATA_PATH)
 
-# ---------------------------------------------------------------------------
 # 1. Functional anchor rules
-# ---------------------------------------------------------------------------
 # For each room type: "required" categories must appear; "optional" ones
 # are sampled in with some probability to add variety.
 # CATEGORY STRINGS MUST MATCH df['category'] EXACTLY — verify and edit these.
@@ -55,9 +51,7 @@ ANCHOR_RULES = {
 OPTIONAL_ITEM_PROB = 0.6  # chance each optional category gets included
 
 
-# ---------------------------------------------------------------------------
 # 2. Style-constrained sampling
-# ---------------------------------------------------------------------------
 def sample_item(category, df, style_key="name", style_value=None):
     """Sample one item of `category`, preferring one matching the style
     constraint (same series, via the 'name' column) if possible, else fall
@@ -101,9 +95,7 @@ def generate_room(room_type, df, style_key="name"):
     return items
 
 
-# ---------------------------------------------------------------------------
 # 3. Generate the full dataset
-# ---------------------------------------------------------------------------
 def generate_dataset(n_rooms, df, room_types=None):
     room_types = room_types or list(ANCHOR_RULES.keys())
     rooms = []
