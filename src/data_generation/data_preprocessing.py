@@ -25,7 +25,7 @@ def clean_dataset():
     # drop exact duplicates based on item ID
     df_clean = df_clean.drop_duplicates(subset=['item_id'])
 
-    df_clean.to_csv('data/processed_ikea_data.csv', index=False)
+    df_clean.to_csv('../../data/processed_ikea_data.csv', index=False)
 
     print(f"Data saved to data/processed_ikea_data.csv")
 
