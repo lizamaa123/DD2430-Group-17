@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from unittest.mock import patch, MagicMock
-from src.evaluation.baseline_models import PopularityPrior, ItemContentBaseline, ItemItemCooccurrence
+from src.models.baseline_models import PopularityPrior, ItemContentBaseline, ItemItemCooccurrence
 
 class TestPopularityPrior(unittest.TestCase):
     def setUp(self):
