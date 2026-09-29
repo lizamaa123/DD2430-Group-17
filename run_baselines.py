@@ -9,12 +9,12 @@ def load_data():
         rooms_data = json.load(f)
         
     # splitting the rooms into training and testing based on pre-set splits 
-    train_rooms = [room["item_ids"] for room in rooms_data if room["split"] == "train"]
-    test_rooms = [room["item_ids"] for room in rooms_data if room["split"] == "test"]
+    train_rooms = [[str(item) for item in room["item_ids"]] for room in rooms_data if room["split"] == "train"]
+    test_rooms = [[str(item) for item in room["item_ids"]] for room in rooms_data if room["split"] == "test"]
 
     # loading and extracting item id from IKEA data for Item Content Baseline
     df = pd.read_csv("data/processed_ikea_data.csv")
-    item_id = df["item_id"].tolist()
+    item_id = pd.to_numeric(df["item_id"], errors='coerce').fillna(0).astype(int).astype(str).tolist()
     
     # Combine the text columns so SentenceBERT has rich descriptions to read
     # e.g., "MALM Beds A high bed frame with 2 storage boxes"
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     print(f"Loaded {len(train_rooms)} training rooms and {len(test_rooms)} test rooms.")
     
     K = 10 # nr of guesses
-    evaluator = LeaveOneOutEvaluator(k=K)
+    evaluator = LeaveOneOutEvaluator()
 
     # ---------------------------------------------------------
     # Evaluate Popularity Prior
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     pop_model.fit(train_rooms)
     
     print("Evaluating Popularity Prior...")
-    pop_recall, pop_ndcg = evaluator(pop_model, test_rooms, k=K)
+    pop_recall, pop_ndcg = evaluator.evaluate(pop_model, test_rooms, k=K)
     print(f"Popularity Prior: Recall@{K} = {pop_recall:.4f} | NDCG@{K} = {pop_ndcg:.4f}")
 
     # ---------------------------------------------------------
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     cooc_model.fit(train_rooms)
     
     print("Evaluating Item-Item Co-occurrence...")
-    cooc_recall, cooc_ndcg = evaluator(cooc_model, test_rooms, k=K)
+    cooc_recall, cooc_ndcg = evaluator.evaluate(cooc_model, test_rooms, k=K)
     print(f"Item-Item Co-occ:Recall@{K} = {cooc_recall:.4f} | NDCG@{K} = {cooc_ndcg:.4f}")
 
     # ---------------------------------------------------------
@@ -62,5 +62,5 @@ if __name__ == "__main__":
     content_model.fit(train_rooms) # does nothing but keeps API consistent
     
     print("Evaluating Item Content Baseline...")
-    content_recall, content_ndcg = evaluator(content_model, test_rooms, k=K)
+    content_recall, content_ndcg = evaluator.evaluate(content_model, test_rooms, k=K)
     print(f"Item Content: Recall@{K} = {content_recall:.4f} | NDCG@{K} = {content_ndcg:.4f}")

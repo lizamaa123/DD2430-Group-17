@@ -1,10 +1,7 @@
 from src.evaluation.metrics import recall_at_k, ndcg_at_k
 
 class LeaveOneOutEvaluator:
-    def __init__(self, k=10):
-        self.k = k
-
-    def evaluate(self, model, test_rooms):
+    def evaluate(self, model, test_rooms, k):
         total_recall = 0.0
         total_ndcg = 0.0
         valid_rooms = 0
@@ -19,10 +16,10 @@ class LeaveOneOutEvaluator:
             partial_room = room[:-1]
 
             # evaluator doesnt care WHAT the model is just that it has a predict method
-            predictions = model.predict(partial_room, k=self.k)
+            predictions = model.predict(partial_room, k=k)
 
-            total_recall += recall_at_k(predictions, target_item, self.k)
-            total_ndcg += ndcg_at_k(predictions, target_item, self.k)
+            total_recall += recall_at_k(predictions, target_item, k)
+            total_ndcg += ndcg_at_k(predictions, target_item, k)
             valid_rooms += 1
 
         # return the average recal and ndcg scores
