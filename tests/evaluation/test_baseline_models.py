@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from unittest.mock import patch, MagicMock
-from src.evaluation.baseline_models import PopularityPrior, ItemContentBaseline
+from src.evaluation.baseline_models import PopularityPrior, ItemContentBaseline, ItemItemCooccurrence
 
 class TestPopularityPrior(unittest.TestCase):
     def setUp(self):
@@ -83,5 +83,53 @@ class TestItemContentBaseline(unittest.TestCase):
         # it defaults to returning the first 2 items in the catalog
         self.assertEqual(predictions, ["wooden_bed", "wooden_nightstand"])
 
+class TestItemItemCooccurrence(unittest.TestCase):
+    def setUp(self):
+        self.training_rooms = [
+            ["MALM bed", "HEMNES nightstand"],
+            ["MALM bed", "HEMNES nightstand", "LACK table"],
+            ["MALM bed", "KLEPPSTAD wardrobe"]
+        ]
+        
+        self.baseline = ItemItemCooccurrence()
+        self.baseline.fit(self.training_rooms)
+        
+        # "MALM bed" pairs: nightstand (2), table (1), wardrobe (1)
+        # "LACK table" pairs: bed (1), nightstand (1)
+        # Popularity: bed (3), nightstand (2), table (1), wardrobe (1)
+
+    def test_predicts_highest_co_occurring_pair(self):
+        """It should predict 'HEMNES nightstand' because it paired with the bed most often."""
+        partial_room = ["MALM bed"]
+        predictions = self.baseline.predict(partial_room, k=1)
+        self.assertEqual(predictions, ["HEMNES nightstand"])
+
+    def test_sums_votes_for_multiple_items(self):
+        """It should add the pair scores together when the room has multiple items."""
+        # Score for nightstand = 2 (from bed) + 1 (from table) = 3
+        # Score for wardrobe = 1 (from bed) + 0 (from table) = 1
+        partial_room = ["MALM bed", "LACK table"]
+        predictions = self.baseline.predict(partial_room, k=1)
+        self.assertEqual(predictions, ["HEMNES nightstand"])
+
+    def test_excludes_items_already_in_room(self):
+        """It should never recommend an item that is already in the partial room."""
+        partial_room = ["MALM bed", "HEMNES nightstand"]
+        predictions = self.baseline.predict(partial_room, k=2)
+        
+        self.assertNotIn("MALM bed", predictions)
+        self.assertNotIn("HEMNES nightstand", predictions)
+        self.assertEqual(predictions[0], "LACK table")
+
+    def test_fallback_to_popular_items(self):
+        """If the room has an unknown item, it should fall back to the popular list."""
+        partial_room = ["ALIEN spaceship"]
+        predictions = self.baseline.predict(partial_room, k=2)
+        
+        self.assertEqual(predictions, ["MALM bed", "HEMNES nightstand"])
+
 if __name__ == '__main__':
     unittest.main()
+
+# to test, run following command in terminal:
+# python -m unittest discover tests/
