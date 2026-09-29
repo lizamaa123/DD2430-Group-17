@@ -6,22 +6,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import math
 
-class SemanticFurniturePredictor(nn.Module):
+class FurnitureEmbeddingPredictor(nn.Module):
 
     def __init__(self, embed_dim=128, hid_dim = 256, nhead=4, num_layers=3, device = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+        print(f"Loaded instance on device: {device}")
         self.to(self.device)
 
         # Trainable representation for the masked slot
-        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim, device=self.device))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=nhead,
             dim_feedforward=hid_dim,
             batch_first=True,
+            device=self.device
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
@@ -29,9 +31,9 @@ class SemanticFurniturePredictor(nn.Module):
 
         # Projection head, outputting logits
         self.proj_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, embed_dim, device=self.device),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, embed_dim, device=self.device),
         )
 
     def forward(self, x, mask_index):
