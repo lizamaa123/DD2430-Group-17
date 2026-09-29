@@ -1,5 +1,6 @@
 import numpy as np
 from sentence_transformers import SentenceTransformer
+# help taken from: https://sbert.net
 
 class PopularityPrior():
     def __init__(self):
