@@ -1,6 +1,5 @@
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 class PopularityPrior():
     def __init__(self):
@@ -46,7 +45,7 @@ class ItemContentBaseline:
         self.item_id = np.array(item_id)
         
         # loading pre-trained SBERT
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
         
         # create embeddings of item descriptions
         self.item_embedding = self.model.encode(item_descriptions)
@@ -74,7 +73,8 @@ class ItemContentBaseline:
         room_embedding = np.mean(present_item_embedding, axis=0).reshape(1, -1)
         
         # caclulate similarity between the room profile and every item
-        similarities = cosine_similarity(room_embedding, self.item_embedding)[0]
+        # convert from pytroch to numpy array
+        similarities = self.model.similarity(room_embedding, self.item_embedding)[0].numpy()
         
         # sort by highest similarity score
         sorted_indices = np.argsort(similarities)[::-1]
