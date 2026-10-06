@@ -4,6 +4,7 @@ import os
 import pickle
 import random
 import zipfile
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 
@@ -524,6 +525,257 @@ def visualize_random_rooms(
             plt.show()
 
 
+def _items_key(room):
+    """
+    What a room's items boil down to when checking for duplicates: its
+    item IDs, sorted, with repeats kept (two identical chairs differ from
+    one chair).
+
+    Args:
+        room: A room record (as in metadata/rooms.json).
+
+    Returns:
+        Tuple of item IDs (jids).
+    """
+    return tuple(sorted(obj["jid"] for obj in room["objects"]))
+
+
+def _layout_key(room):
+    """
+    A room's items together with where they're placed, rounded to 2
+    decimals so tiny numeric differences don't count.
+
+    Args:
+        room: A room record (as in metadata/rooms.json).
+
+    Returns:
+        Tuple, one entry per object, sorted.
+    """
+    return tuple(
+        sorted(
+            (
+                obj["jid"],
+                tuple(round(v, 2) for v in obj["translation"]),
+                tuple(round(v, 2) for v in obj["size"]),
+                round(obj["angle"], 2),
+            )
+            for obj in room["objects"]
+        )
+    )
+
+
+def _read_all_rooms_from_hub(room_types, num_workers):
+    """
+    Read the metadata of every room straight from the Hub into memory
+    (nothing is saved). Takes a while, since each room is a separate read.
+
+    Args:
+        room_types: Which room types to read.
+        num_workers: Number of parallel connections to the Hub.
+
+    Returns:
+        Tuple (rooms, items): dicts keyed by room_uid and jid.
+    """
+    with _remote_zip(ROOMS_ZIP) as rooms_zip:
+        remote_rooms = _list_remote_rooms(rooms_zip, room_types)
+
+    def read_room(rooms_zip, task):
+        room_type, room_uid = task
+        try:
+            return _parse_room(rooms_zip, room_type, room_uid)
+        except (KeyError, ValueError) as error:
+            print(f"Skipping room {room_uid}: {error}")
+            return None
+
+    rooms, items = {}, {}
+    for result in _run_on_remote_zip(ROOMS_ZIP, remote_rooms, read_room, num_workers, "Reading rooms"):
+        if result is not None:
+            room, room_items = result
+            rooms[room["room_uid"]] = room
+            items.update(room_items)
+    return rooms, items
+
+
+def find_and_show_duplicate_rooms(
+    num_groups=3,
+    rooms_per_group=4,
+    min_items=3,
+    room_types=ROOM_TYPES,
+    room_view=DEFAULT_ROOM_VIEW,
+    use_local=True,
+    num_workers=8,
+    cache_dir=DATA_DIR,
+    seed=None,
+):
+    """
+    Find rooms that contain exactly the same items, display a few of those
+    groups, and return how many there are. Nothing is deleted or changed.
+
+    Two rooms count as having the same items if they contain the same
+    item IDs, with the same number of each. Rooms with fewer than
+    min_items items are ignored, because small rooms (e.g. just one bed)
+    often match by coincidence.
+
+    Each displayed group shows the rooms first, then the shared items.
+    Whether the rooms in a group also have the same layout (items placed
+    in the same positions) is checked and reported: same items AND same
+    positions is a stronger sign of a duplicate than same items in
+    different positions.
+
+    Room metadata comes from your downloaded data if there is any (and
+    use_local is True). Otherwise it's read from the Hub into memory,
+    which takes a while because every room has to be read. Images are
+    taken from disk when downloaded and read from the Hub otherwise; nothing
+    is written to disk.
+
+    Args:
+        num_groups: How many duplicate groups to display.
+        rooms_per_group: Max rooms to display per group (larger groups
+            are cut off, but are counted in full in the return value).
+        min_items: Rooms with fewer items than this are ignored.
+        room_types: Which room types to check.
+        room_view: Which render to show for rooms not downloaded ("000" to
+            "007" or "topdown").
+        use_local: Whether to use downloaded data when there is some. Set
+            False to read everything from the Hub.
+        num_workers: Number of parallel connections to the Hub, used only
+            when room metadata has to be read from the Hub.
+        cache_dir: Local root directory to look for downloaded data in.
+            Defaults to data/instructscene/ at the repo root.
+        seed: Optional random seed, for reproducible choice of groups.
+
+    Returns:
+        dict with:
+          - "num_rooms_checked": rooms with at least min_items items.
+          - "num_groups": groups of rooms with identical items.
+          - "num_rooms_in_groups": rooms that are in some group.
+          - "num_redundant_rooms": how many rooms would be left over if
+            each group were reduced to a single room (rooms in groups
+            minus number of groups).
+          - "num_groups_same_layout": groups where every room also has
+            the same item positions.
+          - "groups": list of dicts, one per group, with "room_uids",
+            "room_type" and "same_layout".
+    """
+    rooms, items = _load_local_metadata(cache_dir) if use_local else ({}, {})
+    if not rooms:
+        rooms, items = _read_all_rooms_from_hub(room_types, num_workers)
+
+    rooms = {uid: room for uid, room in rooms.items() if room["room_type"] in room_types}
+    checked = {uid: room for uid, room in rooms.items() if len(room["objects"]) >= min_items}
+
+    by_items = defaultdict(list)
+    for uid in sorted(checked):
+        by_items[_items_key(checked[uid])].append(uid)
+
+    groups = []
+    for key, uids in by_items.items():
+        if len(uids) < 2:
+            continue
+        layouts = {_layout_key(checked[uid]) for uid in uids}
+        groups.append(
+            {
+                "room_uids": uids,
+                "room_type": checked[uids[0]]["room_type"],
+                "same_layout": len(layouts) == 1,
+            }
+        )
+    groups.sort(key=lambda group: group["room_uids"][0])
+
+    summary = {
+        "num_rooms_checked": len(checked),
+        "num_groups": len(groups),
+        "num_rooms_in_groups": sum(len(group["room_uids"]) for group in groups),
+        "num_redundant_rooms": sum(len(group["room_uids"]) - 1 for group in groups),
+        "num_groups_same_layout": sum(group["same_layout"] for group in groups),
+        "groups": groups,
+    }
+    print(
+        f"{summary['num_groups']} groups of rooms with identical items "
+        f"({summary['num_rooms_in_groups']} of {summary['num_rooms_checked']} rooms with at least "
+        f"{min_items} items; in {summary['num_groups_same_layout']} of the groups the layouts are identical too)"
+    )
+
+    with ExitStack() as stack:
+        open_zips = {}
+
+        def get_zip(zip_name):
+            # Each zip is opened at most once, and only if something
+            # actually has to be read from it.
+            if zip_name not in open_zips:
+                open_zips[zip_name] = stack.enter_context(_remote_zip(zip_name))
+            return open_zips[zip_name]
+
+        def load_room_image(room):
+            path = _local_room_image_path(cache_dir, room["room_type"], room["room_uid"])
+            if use_local and os.path.exists(path):
+                image = Image.open(path)
+            else:
+                member = _room_image_in_zip(room["room_type"], room["room_uid"], room_view)
+                image = Image.open(io.BytesIO(get_zip(ROOMS_ZIP).read(member)))
+            image.load()
+            return image
+
+        def load_item_image(jid):
+            path = _local_item_image_path(cache_dir, jid)
+            try:
+                if use_local and os.path.exists(path):
+                    image = Image.open(path)
+                else:
+                    image = Image.open(io.BytesIO(get_zip(ITEMS_ZIP).read(_item_image_in_zip(jid))))
+            except KeyError:
+                return None  # no image for this item in the dataset
+            image.load()
+            return image
+
+        shown = random.Random(seed).sample(groups, k=min(num_groups, len(groups)))
+        for number, group in enumerate(shown, start=1):
+            group_rooms = [rooms[uid] for uid in group["room_uids"][:rooms_per_group]]
+
+            images, labels = [], []
+            for room in group_rooms:
+                images.append(load_room_image(room))
+                short_id = room["room_uid"].split("_")[0][:8]
+                labels.append(f"{room['room_type']} ({room['scene_type']})\n{short_id}")
+
+            for jid in sorted(set(_items_key(group_rooms[0]))):
+                image = load_item_image(jid)
+                if image is None:
+                    continue
+                info = items.get(jid, {})
+                images.append(image)
+                labels.append(f"{info.get('category') or 'unknown category'}\n({info.get('style') or 'unknown style'})")
+
+            max_cols = 7
+            num_panels = len(images)
+            num_cols = min(max_cols, num_panels)
+            num_rows = -(-num_panels // num_cols)  # ceil division
+
+            fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows))
+            axes = [axes] if num_panels == 1 else axes.flatten()
+
+            for ax, image, label in zip(axes, images, labels):
+                ax.imshow(image)
+                ax.set_title(label)
+                ax.axis("off")
+            for ax in axes[num_panels:]:
+                ax.axis("off")
+
+            layout = "same layout" if group["same_layout"] else "different layouts"
+            cut_off = f", showing {len(group_rooms)}" if len(group["room_uids"]) > len(group_rooms) else ""
+            fig.suptitle(
+                f"Group {number}: {len(group['room_uids'])} rooms with identical items ({layout}{cut_off}). "
+                f"Rooms first, then the shared items.",
+                fontsize=14,
+            )
+            plt.tight_layout()
+            plt.show()
+
+    return summary
+
+
+
 if __name__ == "__main__":
-    visualize_random_rooms()
+    #visualize_random_rooms()
     #download_instructscene_subset()
+    find_and_show_duplicate_rooms(num_groups=10)
