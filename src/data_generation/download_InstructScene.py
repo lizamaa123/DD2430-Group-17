@@ -1,0 +1,527 @@
+import io
+import json
+import os
+import pickle
+import random
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
+
+import matplotlib.pyplot as plt
+import numpy as np
+from huggingface_hub import HfFileSystem
+from PIL import Image
+from tqdm import tqdm
+
+REPO_PATH = "datasets/chenguolin/InstructScene_dataset"
+
+# The two zips we read from. Neither is ever downloaded whole: zip files have
+# an index of their members, so single files can be read straight off the Hub.
+ROOMS_ZIP = "InstructScene.zip"  # ~5 GB: room renders + per-room metadata
+ITEMS_ZIP = "3D-FRONT.zip"  # ~26 GB: mostly 3D meshes; only item preview images are read
+
+# Where downloaded files are stored, relative to the repo root.
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "instructscene")
+
+ROOM_TYPES = ("bedroom", "diningroom", "livingroom")
+
+# Each room has 8 rendered perspective views (000-007) and a top-down view;
+# only one of them is kept per room.
+ROOM_VIEWS = tuple(f"{i:03d}" for i in range(8)) + ("topdown",)
+DEFAULT_ROOM_VIEW = "000"
+
+# Per-item attributes copied from models_info.pkl. These describe the item
+# itself (identical in every room it appears in), so they're stored once per
+# item in items.json rather than repeated in every room.
+ITEM_FIELDS = (
+    "super-category",
+    "category",
+    "style",
+    "theme",
+    "material",
+    "chatgpt_caption",
+    "blip_caption",
+    "msft_caption",
+)
+
+# How much is fetched per network request when reading from a zip on the Hub.
+# Small enough that reading one ~100 KB image doesn't pull megabytes.
+REMOTE_BLOCK_SIZE = 256 * 1024
+
+
+@contextmanager
+def _remote_zip(zip_name):
+    """
+    Open one of the dataset's zips on the Hugging Face Hub for reading,
+    without downloading it. Only the zip's index and the members actually
+    read are fetched.
+
+    Args:
+        zip_name: Filename of the zip in the dataset repo (ROOMS_ZIP or
+            ITEMS_ZIP).
+
+    Returns:
+        A context manager yielding an open zipfile.ZipFile.
+    """
+    fs = HfFileSystem()
+    with fs.open(f"{REPO_PATH}/{zip_name}", "rb", block_size=REMOTE_BLOCK_SIZE) as f:
+        with zipfile.ZipFile(f) as z:
+            yield z
+
+
+def _room_dir_in_zip(room_type, room_uid):
+    """
+    Path of a room's folder inside InstructScene.zip.
+
+    Args:
+        room_type: "bedroom", "diningroom" or "livingroom".
+        room_uid: The room's unique ID, e.g.
+            "36cf981f-f4fd-41dd-a0c3-52d8f4511855_SecondBedroom-28815".
+
+    Returns:
+        str, e.g. "InstructScene/threed_front_bedroom/{room_uid}".
+    """
+    return f"InstructScene/threed_front_{room_type}/{room_uid}"
+
+
+def _room_image_in_zip(room_type, room_uid, room_view):
+    """
+    Path of one rendered view of a room inside InstructScene.zip.
+
+    Args:
+        room_type: "bedroom", "diningroom" or "livingroom".
+        room_uid: The room's unique ID.
+        room_view: Which render to use, one of ROOM_VIEWS.
+
+    Returns:
+        str path of the .png inside the zip.
+    """
+    return f"{_room_dir_in_zip(room_type, room_uid)}/blender_rendered_scene_256/{room_view}.png"
+
+
+def _item_image_in_zip(jid):
+    """
+    Path of an item's preview image inside 3D-FRONT.zip.
+
+    Args:
+        jid: The item's 3D-FUTURE model ID (called jid in boxes.npz and
+            model_id in models_info.pkl).
+
+    Returns:
+        str path of the .jpg inside the zip.
+    """
+    return f"3D-FRONT/3D-FUTURE-model/{jid}/image.jpg"
+
+
+def _local_room_image_path(cache_dir, room_type, room_uid):
+    """
+    Where a room's image is stored locally.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+        room_type: "bedroom", "diningroom" or "livingroom".
+        room_uid: The room's unique ID.
+
+    Returns:
+        str, cache_dir/rooms/{room_type}/{room_uid}.png.
+    """
+    return os.path.join(cache_dir, "rooms", room_type, f"{room_uid}.png")
+
+
+def _local_item_image_path(cache_dir, jid):
+    """
+    Where an item's image is stored locally.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+        jid: The item's 3D-FUTURE model ID.
+
+    Returns:
+        str, cache_dir/items/{jid}.jpg.
+    """
+    return os.path.join(cache_dir, "items", f"{jid}.jpg")
+
+
+def _list_remote_rooms(rooms_zip, room_types):
+    """
+    List every room of the given types in InstructScene.zip, using only the
+    zip's index (no room data is read).
+
+    Args:
+        rooms_zip: Open zipfile.ZipFile of InstructScene.zip.
+        room_types: Iterable of room types to include.
+
+    Returns:
+        Sorted list of (room_type, room_uid) tuples.
+    """
+    rooms = []
+    for name in rooms_zip.namelist():
+        parts = name.split("/")
+        # A room is identified by its boxes.npz:
+        # InstructScene/threed_front_{room_type}/{room_uid}/boxes.npz
+        if len(parts) != 4 or parts[3] != "boxes.npz" or not parts[1].startswith("threed_front_"):
+            continue
+        room_type = parts[1][len("threed_front_"):]
+        if room_type in room_types:
+            rooms.append((room_type, parts[2]))
+    return sorted(rooms)
+
+
+def _parse_room(rooms_zip, room_type, room_uid):
+    """
+    Read one room's metadata from InstructScene.zip: which items it
+    contains, where each one is placed, and each item's attributes.
+
+    Reads boxes.npz (placement of every object) and models_info.pkl (one
+    entry per object, in the same order, with the item's ID, category,
+    style and captions).
+
+    Args:
+        rooms_zip: Open zipfile.ZipFile of InstructScene.zip.
+        room_type: "bedroom", "diningroom" or "livingroom".
+        room_uid: The room's unique ID.
+
+    Returns:
+        A (room, items) tuple:
+          - room: dict with "room_uid", "room_type", "scene_type" (finer
+            label, e.g. "secondbedroom") and "objects", a list with one
+            dict per object: "jid", "translation", "size", "angle".
+          - items: dict mapping each jid in the room to its attributes
+            (the ITEM_FIELDS).
+    """
+    room_dir = _room_dir_in_zip(room_type, room_uid)
+    boxes = np.load(io.BytesIO(rooms_zip.read(f"{room_dir}/boxes.npz")))
+    models_info = pickle.loads(rooms_zip.read(f"{room_dir}/models_info.pkl"))
+
+    jids = [str(jid) for jid in boxes["jids"]]
+    if [info["model_id"] for info in models_info] != jids:
+        raise ValueError(f"boxes.npz and models_info.pkl disagree on the items in room {room_uid}")
+
+    objects = [
+        {
+            "jid": jid,
+            "translation": translation.tolist(),
+            "size": size.tolist(),
+            "angle": float(angle[0]),
+        }
+        for jid, translation, size, angle in zip(jids, boxes["translations"], boxes["sizes"], boxes["angles"])
+    ]
+    room = {
+        "room_uid": room_uid,
+        "room_type": room_type,
+        "scene_type": str(boxes["scene_type"]),
+        "objects": objects,
+    }
+    items = {info["model_id"]: {field: info.get(field) for field in ITEM_FIELDS} for info in models_info}
+    return room, items
+
+
+def _load_local_metadata(cache_dir):
+    """
+    Load the locally stored room and item metadata, if any has been
+    downloaded.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+
+    Returns:
+        A (rooms, items) tuple of dicts, keyed by room_uid and jid. Both
+        are empty if nothing has been downloaded yet.
+    """
+    rooms_path = os.path.join(cache_dir, "metadata", "rooms.json")
+    items_path = os.path.join(cache_dir, "metadata", "items.json")
+    if not (os.path.exists(rooms_path) and os.path.exists(items_path)):
+        return {}, {}
+
+    with open(rooms_path) as f:
+        rooms = {room["room_uid"]: room for room in json.load(f)}
+    with open(items_path) as f:
+        items = json.load(f)
+    return rooms, items
+
+
+def _save_local_metadata(cache_dir, rooms, items):
+    """
+    Write the room and item metadata to cache_dir/metadata/.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+        rooms: Dict of room records keyed by room_uid.
+        items: Dict of item attributes keyed by jid.
+
+    Returns:
+        None.
+    """
+    metadata_dir = os.path.join(cache_dir, "metadata")
+    os.makedirs(metadata_dir, exist_ok=True)
+    with open(os.path.join(metadata_dir, "rooms.json"), "w") as f:
+        json.dump([rooms[uid] for uid in sorted(rooms)], f)
+    with open(os.path.join(metadata_dir, "items.json"), "w") as f:
+        json.dump({jid: items[jid] for jid in sorted(items)}, f)
+
+
+def _run_on_remote_zip(zip_name, tasks, worker, num_workers, desc):
+    """
+    Run worker(zip, task) for every task, spread over several threads.
+    Each thread opens its own connection to the zip, since reads over the
+    network are slow one at a time but parallelize well.
+
+    Args:
+        zip_name: Filename of the zip in the dataset repo.
+        tasks: List of tasks to process.
+        worker: Function taking (open ZipFile, task) and returning a result.
+        num_workers: Number of threads.
+        desc: Label for the progress bar.
+
+    Returns:
+        List of worker results (in no particular order).
+    """
+    if not tasks:
+        return []
+
+    num_workers = max(1, min(num_workers, len(tasks)))
+    chunks = [tasks[i::num_workers] for i in range(num_workers)]
+    progress = tqdm(total=len(tasks), desc=desc)
+
+    def process_chunk(chunk):
+        results = []
+        with _remote_zip(zip_name) as z:
+            for task in chunk:
+                results.append(worker(z, task))
+                progress.update(1)
+        return results
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        chunk_results = list(executor.map(process_chunk, chunks))
+    progress.close()
+    return [result for results in chunk_results for result in results]
+
+
+def download_instructscene_subset(
+    room_types=ROOM_TYPES,
+    room_view=DEFAULT_ROOM_VIEW,
+    max_rooms_per_type=None,
+    include_item_images=True,
+    num_workers=8,
+    cache_dir=DATA_DIR,
+):
+    """
+    Download only what's needed from the InstructScene version of 3D-FRONT:
+    one image per room, one image per item, and compact metadata.
+
+    Stored under cache_dir:
+      - rooms/{room_type}/{room_uid}.png -> one 256 px render per room.
+      - items/{jid}.jpg                 -> one preview image per item.
+      - metadata/rooms.json             -> per room: room type, finer
+                                           scene type, and its objects
+                                           (item jid + position, size,
+                                           rotation).
+      - metadata/items.json             -> per item: category, style,
+                                           theme, material, captions.
+
+    Skipped: the other 8 renders per room, 3D meshes and textures,
+    OpenShape/CLIP features, scene graphs, and the pretrained model
+    checkpoints in the repo.
+
+    Files are read straight out of the zips on the Hub, so the 5 GB and
+    26 GB zips are never downloaded whole. Already-downloaded rooms and
+    items are skipped, so an interrupted run can simply be restarted.
+
+    Args:
+        room_types: Which room types to download; any of "bedroom",
+            "diningroom", "livingroom".
+        room_view: Which render to keep per room: "000" to "007"
+            (perspective views) or "topdown".
+        max_rooms_per_type: If set, only download this many rooms per
+            room type (useful for a quick test). None downloads all.
+        include_item_images: Whether to download item images. If False,
+            only room images and metadata are downloaded.
+        num_workers: Number of parallel connections to the Hub.
+        cache_dir: Local directory everything is stored in. Defaults to
+            data/instructscene/ at the repo root.
+
+    Returns:
+        dict with "rooms" and "items" (counts stored locally), and
+        "missing_item_images" (jids with no image in the dataset).
+    """
+    if room_view not in ROOM_VIEWS:
+        raise ValueError(f"room_view must be one of {ROOM_VIEWS}, got {room_view!r}")
+
+    rooms, items = _load_local_metadata(cache_dir)
+
+    with _remote_zip(ROOMS_ZIP) as rooms_zip:
+        remote_rooms = _list_remote_rooms(rooms_zip, room_types)
+
+    if max_rooms_per_type is not None:
+        selected = []
+        for room_type in room_types:
+            selected += [room for room in remote_rooms if room[0] == room_type][:max_rooms_per_type]
+        remote_rooms = selected
+
+    rooms_to_fetch = [
+        (room_type, room_uid)
+        for room_type, room_uid in remote_rooms
+        if room_uid not in rooms or not os.path.exists(_local_room_image_path(cache_dir, room_type, room_uid))
+    ]
+
+    def fetch_room(rooms_zip, task):
+        room_type, room_uid = task
+        try:
+            room, room_items = _parse_room(rooms_zip, room_type, room_uid)
+            image_bytes = rooms_zip.read(_room_image_in_zip(room_type, room_uid, room_view))
+        except (KeyError, ValueError) as error:
+            print(f"Skipping room {room_uid}: {error}")
+            return None
+
+        image_path = _local_room_image_path(cache_dir, room_type, room_uid)
+        os.makedirs(os.path.dirname(image_path), exist_ok=True)
+        with open(image_path, "wb") as f:
+            f.write(image_bytes)
+        room["image_view"] = room_view
+        return room, room_items
+
+    for result in _run_on_remote_zip(ROOMS_ZIP, rooms_to_fetch, fetch_room, num_workers, "Rooms"):
+        if result is not None:
+            room, room_items = result
+            rooms[room["room_uid"]] = room
+            items.update(room_items)
+
+    # Saved before fetching item images, so room progress isn't lost if
+    # the item step is interrupted.
+    _save_local_metadata(cache_dir, rooms, items)
+
+    missing_item_images = []
+    if include_item_images:
+        items_to_fetch = [jid for jid in sorted(items) if not os.path.exists(_local_item_image_path(cache_dir, jid))]
+
+        def fetch_item(items_zip, jid):
+            try:
+                image_bytes = items_zip.read(_item_image_in_zip(jid))
+            except KeyError:
+                return jid
+            image_path = _local_item_image_path(cache_dir, jid)
+            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+            return None
+
+        results = _run_on_remote_zip(ITEMS_ZIP, items_to_fetch, fetch_item, num_workers, "Items")
+        missing_item_images = sorted(jid for jid in results if jid is not None)
+        if missing_item_images:
+            print(f"{len(missing_item_images)} items have no image in {ITEMS_ZIP}")
+
+    return {"rooms": len(rooms), "items": len(items), "missing_item_images": missing_item_images}
+
+
+def visualize_random_rooms(
+    num_rooms=3,
+    room_types=ROOM_TYPES,
+    room_view=DEFAULT_ROOM_VIEW,
+    use_local=True,
+    cache_dir=DATA_DIR,
+    seed=None,
+):
+    """
+    Sanity-check the data by displaying random rooms next to every item in
+    them, with each item's category and style shown above its image.
+
+    Works whether or not the data is downloaded:
+      - If use_local is True and rooms have been downloaded to cache_dir,
+        rooms are sampled from those and their stored files are used.
+        Anything missing locally (e.g. an item image) is read from the Hub.
+      - Otherwise rooms are sampled from the whole dataset on the Hub and
+        read straight into memory. Nothing is written to disk, so there's
+        nothing to clean up afterward.
+
+    This is a visualization/debugging aid for checking that the data
+    extraction is correct - it isn't part of the data pipeline itself.
+
+    Args:
+        num_rooms: How many random rooms to display.
+        room_types: Which room types to sample from.
+        room_view: Which render to show for rooms read from the Hub ("000"
+            to "007" or "topdown"). Locally stored rooms show the view that
+            was downloaded.
+        use_local: Whether to use downloaded data when there is some. Set
+            False to test the no-download path even with data on disk.
+        cache_dir: Local root directory to look for downloaded data in.
+            Defaults to data/instructscene/ at the repo root.
+        seed: Optional random seed, for reproducible sampling.
+
+    Returns:
+        None.
+    """
+    rng = random.Random(seed)
+    local_rooms, local_items = _load_local_metadata(cache_dir) if use_local else ({}, {})
+
+    with ExitStack() as stack:
+        open_zips = {}
+
+        def get_zip(zip_name):
+            # Each zip is opened at most once, and only if something
+            # actually has to be read from it.
+            if zip_name not in open_zips:
+                open_zips[zip_name] = stack.enter_context(_remote_zip(zip_name))
+            return open_zips[zip_name]
+
+        candidates = sorted(
+            (room["room_type"], uid) for uid, room in local_rooms.items() if room["room_type"] in room_types
+        )
+        if not candidates:
+            candidates = _list_remote_rooms(get_zip(ROOMS_ZIP), room_types)
+
+        for room_type, room_uid in rng.sample(candidates, k=min(num_rooms, len(candidates))):
+            if room_uid in local_rooms:
+                room, room_items = local_rooms[room_uid], local_items
+            else:
+                room, room_items = _parse_room(get_zip(ROOMS_ZIP), room_type, room_uid)
+
+            room_image_path = _local_room_image_path(cache_dir, room_type, room_uid)
+            if use_local and os.path.exists(room_image_path):
+                room_image = Image.open(room_image_path)
+            else:
+                room_image = Image.open(io.BytesIO(get_zip(ROOMS_ZIP).read(_room_image_in_zip(room_type, room_uid, room_view))))
+            room_image.load()
+
+            images = [room_image]
+            labels = [f"{room_type}\n({room['scene_type']})"]
+            for obj in room["objects"]:
+                jid = obj["jid"]
+                item_image_path = _local_item_image_path(cache_dir, jid)
+                if use_local and os.path.exists(item_image_path):
+                    item_image = Image.open(item_image_path)
+                else:
+                    try:
+                        item_image = Image.open(io.BytesIO(get_zip(ITEMS_ZIP).read(_item_image_in_zip(jid))))
+                    except KeyError:
+                        continue  # no image for this item in the dataset
+                item_image.load()
+
+                info = room_items.get(jid, {})
+                images.append(item_image)
+                labels.append(f"{info.get('category') or 'unknown category'}\n({info.get('style') or 'unknown style'})")
+
+            max_cols = 7
+            num_panels = len(images)
+            num_cols = min(max_cols, num_panels)
+            num_rows = -(-num_panels // num_cols)  # ceil division
+
+            fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows))
+            axes = [axes] if num_panels == 1 else axes.flatten()
+
+            for ax, image, label in zip(axes, images, labels):
+                ax.imshow(image)
+                ax.set_title(label)
+                ax.axis("off")
+
+            # Hide any unused panels left over in the last row.
+            for ax in axes[num_panels:]:
+                ax.axis("off")
+
+            plt.tight_layout()
+            plt.show()
+
+
+if __name__ == "__main__":
+    visualize_random_rooms()
+    #download_instructscene_subset(max_rooms_per_type=5)
