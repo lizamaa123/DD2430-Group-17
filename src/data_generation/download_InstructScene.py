@@ -24,6 +24,12 @@ ITEMS_ZIP = "3D-FRONT.zip"  # ~26 GB: mostly 3D meshes; only item preview images
 # Where downloaded files are stored, relative to the repo root.
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "instructscene")
 
+# Rooms listed here (one room_uid per line) are treated as not existing: they
+# are never downloaded, sampled or displayed. It lives next to the code, not
+# in data/, so it is committed and shared by everyone. Written by
+# delete_duplicate_rooms.
+EXCLUDED_ROOMS_PATH = os.path.join(os.path.dirname(__file__), "instructscene_excluded_rooms.txt")
+
 ROOM_TYPES = ("bedroom", "diningroom", "livingroom")
 
 # Each room has 8 rendered perspective views (000-007) and a top-down view;
@@ -143,10 +149,45 @@ def _local_item_image_path(cache_dir, jid):
     return os.path.join(cache_dir, "items", f"{jid}.jpg")
 
 
+def _load_excluded_rooms():
+    """
+    Read the list of excluded rooms (EXCLUDED_ROOMS_PATH).
+
+    Args:
+        None.
+
+    Returns:
+        Set of room_uids to ignore. Empty if the file doesn't exist.
+    """
+    if not os.path.exists(EXCLUDED_ROOMS_PATH):
+        return set()
+    with open(EXCLUDED_ROOMS_PATH) as f:
+        lines = (line.strip() for line in f)
+        return {line for line in lines if line and not line.startswith("#")}
+
+
+def _save_excluded_rooms(room_uids):
+    """
+    Write the list of excluded rooms (EXCLUDED_ROOMS_PATH), sorted so that
+    git diffs stay small.
+
+    Args:
+        room_uids: Iterable of room_uids to exclude.
+
+    Returns:
+        None.
+    """
+    with open(EXCLUDED_ROOMS_PATH, "w") as f:
+        f.write("# Rooms that are ignored everywhere (duplicates of another room).\n")
+        f.write("# One room_uid per line. Written by delete_duplicate_rooms.\n")
+        for uid in sorted(set(room_uids)):
+            f.write(f"{uid}\n")
+
+
 def _list_remote_rooms(rooms_zip, room_types):
     """
     List every room of the given types in InstructScene.zip, using only the
-    zip's index (no room data is read).
+    zip's index (no room data is read). Excluded rooms are left out.
 
     Args:
         rooms_zip: Open zipfile.ZipFile of InstructScene.zip.
@@ -155,6 +196,7 @@ def _list_remote_rooms(rooms_zip, room_types):
     Returns:
         Sorted list of (room_type, room_uid) tuples.
     """
+    excluded = _load_excluded_rooms()
     rooms = []
     for name in rooms_zip.namelist():
         parts = name.split("/")
@@ -163,7 +205,7 @@ def _list_remote_rooms(rooms_zip, room_types):
         if len(parts) != 4 or parts[3] != "boxes.npz" or not parts[1].startswith("threed_front_"):
             continue
         room_type = parts[1][len("threed_front_"):]
-        if room_type in room_types:
+        if room_type in room_types and parts[2] not in excluded:
             rooms.append((room_type, parts[2]))
     return sorted(rooms)
 
@@ -220,7 +262,7 @@ def _parse_room(rooms_zip, room_type, room_uid):
 def _load_local_metadata(cache_dir):
     """
     Load the locally stored room and item metadata, if any has been
-    downloaded.
+    downloaded. Excluded rooms are left out.
 
     Args:
         cache_dir: Local root directory data is stored under.
@@ -234,8 +276,9 @@ def _load_local_metadata(cache_dir):
     if not (os.path.exists(rooms_path) and os.path.exists(items_path)):
         return {}, {}
 
+    excluded = _load_excluded_rooms()
     with open(rooms_path) as f:
-        rooms = {room["room_uid"]: room for room in json.load(f)}
+        rooms = {room["room_uid"]: room for room in json.load(f) if room["room_uid"] not in excluded}
     with open(items_path) as f:
         items = json.load(f)
     return rooms, items
@@ -564,6 +607,32 @@ def _layout_key(room):
     )
 
 
+def _find_duplicate_groups(rooms, min_items):
+    """
+    Group rooms that contain the same items (same item IDs, same number of
+    each). Rooms with fewer than min_items items are ignored.
+
+    Args:
+        rooms: Dict of room records keyed by room_uid.
+        min_items: Rooms with fewer items than this are ignored.
+
+    Returns:
+        Tuple (checked, groups):
+          - checked: dict of the rooms that were considered.
+          - groups: list of lists of room_uids (each sorted, at least two
+            per list), ordered by the first room_uid of each list.
+    """
+    checked = {uid: room for uid, room in rooms.items() if len(room["objects"]) >= min_items}
+
+    by_items = defaultdict(list)
+    for uid in sorted(checked):
+        by_items[_items_key(checked[uid])].append(uid)
+
+    groups = [uids for uids in by_items.values() if len(uids) >= 2]
+    groups.sort(key=lambda uids: uids[0])
+    return checked, groups
+
+
 def _read_all_rooms_from_hub(room_types, num_workers):
     """
     Read the metadata of every room straight from the Hub into memory
@@ -606,6 +675,8 @@ def find_and_show_duplicate_rooms(
     num_workers=8,
     cache_dir=DATA_DIR,
     seed=None,
+    only_mixed_room_types=False,
+    only_rearranged=False,
 ):
     """
     Find rooms that contain exactly the same items, display a few of those
@@ -643,6 +714,15 @@ def find_and_show_duplicate_rooms(
         cache_dir: Local root directory to look for downloaded data in.
             Defaults to data/instructscene/ at the repo root.
         seed: Optional random seed, for reproducible choice of groups.
+        only_mixed_room_types: If True, only consider groups whose rooms
+            are in different room types (e.g. a bedroom and a livingroom
+            with the same items), such as open-plan living/dining rooms.
+            Everything below (the counts and the displayed groups) then
+            covers only those groups.
+        only_rearranged: If True, only consider groups whose rooms don't
+            all have the same layout, i.e. the items are placed differently
+            (rooms that are mirrored, or have some items moved). Can be
+            combined with only_mixed_room_types.
 
     Returns:
         dict with:
@@ -655,32 +735,32 @@ def find_and_show_duplicate_rooms(
           - "num_groups_same_layout": groups where every room also has
             the same item positions.
           - "groups": list of dicts, one per group, with "room_uids",
-            "room_type" and "same_layout".
+            "room_type" (that of the first room), "room_types" (all room
+            types in the group, sorted) and "same_layout".
     """
     rooms, items = _load_local_metadata(cache_dir) if use_local else ({}, {})
     if not rooms:
         rooms, items = _read_all_rooms_from_hub(room_types, num_workers)
 
     rooms = {uid: room for uid, room in rooms.items() if room["room_type"] in room_types}
-    checked = {uid: room for uid, room in rooms.items() if len(room["objects"]) >= min_items}
-
-    by_items = defaultdict(list)
-    for uid in sorted(checked):
-        by_items[_items_key(checked[uid])].append(uid)
+    checked, uid_groups = _find_duplicate_groups(rooms, min_items)
 
     groups = []
-    for key, uids in by_items.items():
-        if len(uids) < 2:
+    for uids in uid_groups:
+        group_room_types = sorted({checked[uid]["room_type"] for uid in uids})
+        if only_mixed_room_types and len(group_room_types) < 2:
             continue
         layouts = {_layout_key(checked[uid]) for uid in uids}
+        if only_rearranged and len(layouts) == 1:
+            continue
         groups.append(
             {
                 "room_uids": uids,
                 "room_type": checked[uids[0]]["room_type"],
+                "room_types": group_room_types,
                 "same_layout": len(layouts) == 1,
             }
         )
-    groups.sort(key=lambda group: group["room_uids"][0])
 
     summary = {
         "num_rooms_checked": len(checked),
@@ -691,7 +771,9 @@ def find_and_show_duplicate_rooms(
         "groups": groups,
     }
     print(
-        f"{summary['num_groups']} groups of rooms with identical items "
+        f"{summary['num_groups']} groups of rooms with identical items"
+        f"{' in different room types' if only_mixed_room_types else ''}"
+        f"{' and different layouts' if only_rearranged else ''} "
         f"({summary['num_rooms_in_groups']} of {summary['num_rooms_checked']} rooms with at least "
         f"{min_items} items; in {summary['num_groups_same_layout']} of the groups the layouts are identical too)"
     )
@@ -764,7 +846,8 @@ def find_and_show_duplicate_rooms(
             layout = "same layout" if group["same_layout"] else "different layouts"
             cut_off = f", showing {len(group_rooms)}" if len(group["room_uids"]) > len(group_rooms) else ""
             fig.suptitle(
-                f"Group {number}: {len(group['room_uids'])} rooms with identical items ({layout}{cut_off}). "
+                f"Group {number}: {len(group['room_uids'])} rooms with identical items "
+                f"({', '.join(group['room_types'])}; {layout}{cut_off}). "
                 f"Rooms first, then the shared items.",
                 fontsize=14,
             )
@@ -775,7 +858,163 @@ def find_and_show_duplicate_rooms(
 
 
 
+def delete_duplicate_rooms(
+    min_items=3,
+    room_types=ROOM_TYPES,
+    use_local=True,
+    num_workers=8,
+    dry_run=True,
+    cache_dir=DATA_DIR,
+):
+    """
+    Remove duplicate rooms, keeping exactly one room per group of rooms with
+    the same items, and make sure the removed rooms never come back.
+
+    Duplicates are rooms with the same item IDs (same number of each),
+    whatever their layout, so mirrored rooms and rooms with small position
+    differences count as duplicates. A different scene_type (e.g. "bedroom"
+    vs "masterbedroom") is ignored. Rooms with fewer than min_items items are
+    ignored, as in find_and_show_duplicate_rooms.
+
+    Duplicates are removed within a room type. A group with rooms in several
+    room types (typically open-plan living/dining rooms, which exist as a
+    livingroom and a diningroom) keeps one room in each of those types, so
+    the room stays in both classes, and only extra copies within the same
+    type are removed.
+
+    The room kept is the first one when sorted by room_uid. That is
+    arbitrary but deterministic, so it's the same on every machine.
+
+    With dry_run=True (the default) only prints and returns what would
+    happen. Otherwise:
+      1. The removed room_uids are added to EXCLUDED_ROOMS_PATH
+         (src/data_generation/instructscene_excluded_rooms.txt). Commit this
+         file so everyone ignores the same rooms. The download and
+         visualization functions skip every room in it, whether the data is
+         downloaded or read from the Hub.
+      2. Downloaded images of the removed rooms are deleted and the rooms
+         are dropped from metadata/rooms.json. Item images stay, since other
+         rooms may use them.
+
+    Which rooms are duplicates is decided from the whole dataset: downloaded
+    metadata is only used if it covers every room of room_types, otherwise
+    all rooms are read from the Hub into memory (slow, nothing is saved).
+    This keeps the result the same no matter how much you have downloaded.
+
+    Args:
+        min_items: Rooms with fewer items than this are ignored.
+        room_types: Which room types to deduplicate.
+        use_local: Whether to use downloaded metadata when it covers all
+            rooms. Set False to always read from the Hub.
+        num_workers: Number of parallel connections to the Hub, used only
+            when room metadata has to be read from the Hub.
+        dry_run: If True, change nothing and only report.
+        cache_dir: Local root directory where downloaded data is stored.
+            Defaults to data/instructscene/ at the repo root.
+
+    Returns:
+        dict with:
+          - "dry_run": whether anything was changed.
+          - "num_groups": sets of duplicate rooms within one room type
+            (a group spanning two room types counts once per type that has
+            more than one room in it).
+          - "num_removed": rooms removed (or that would be, in a dry run).
+          - "removed_per_room_type": dict room_type -> rooms removed.
+          - "groups": list of dicts with "keep", "remove" (list of
+            room_uids) and "room_type".
+          - "mixed_type_groups": groups (lists of room_uids) whose rooms
+            span several room types. One room per type is kept in each.
+          - "num_groups_different_layout": groups in "groups" whose rooms
+            don't all have identical layouts (includes mirrored rooms).
+    """
+    with _remote_zip(ROOMS_ZIP) as rooms_zip:
+        remote_uids = {uid for _, uid in _list_remote_rooms(rooms_zip, room_types)}
+
+    local_rooms, _ = _load_local_metadata(cache_dir) if use_local else ({}, {})
+    local_rooms = {uid: room for uid, room in local_rooms.items() if room["room_type"] in room_types}
+    if use_local and remote_uids and remote_uids <= set(local_rooms):
+        rooms = local_rooms
+    else:
+        if local_rooms:
+            print("Downloaded metadata doesn't cover every room, so reading all rooms from the Hub instead.")
+        rooms, _ = _read_all_rooms_from_hub(room_types, num_workers)
+    rooms = {uid: room for uid, room in rooms.items() if room["room_type"] in room_types}
+
+    checked, uid_groups = _find_duplicate_groups(rooms, min_items)
+
+    groups, mixed_type_groups = [], []
+    for uids in uid_groups:
+        uids_per_type = defaultdict(list)
+        for uid in uids:
+            uids_per_type[checked[uid]["room_type"]].append(uid)
+        if len(uids_per_type) > 1:
+            mixed_type_groups.append(uids)
+
+        # Duplicates are only removed within a room type.
+        for room_type, type_uids in sorted(uids_per_type.items()):
+            if len(type_uids) < 2:
+                continue
+            groups.append(
+                {
+                    "keep": type_uids[0],
+                    "remove": type_uids[1:],
+                    "room_type": room_type,
+                    "different_layout": len({_layout_key(checked[uid]) for uid in type_uids}) > 1,
+                }
+            )
+
+    removed_per_room_type = defaultdict(int)
+    for group in groups:
+        removed_per_room_type[group["room_type"]] += len(group["remove"])
+    to_remove = [uid for group in groups for uid in group["remove"]]
+
+    summary = {
+        "dry_run": dry_run,
+        "num_groups": len(groups),
+        "num_removed": len(to_remove),
+        "removed_per_room_type": dict(removed_per_room_type),
+        "groups": [{key: group[key] for key in ("keep", "remove", "room_type")} for group in groups],
+        "mixed_type_groups": mixed_type_groups,
+        "num_groups_different_layout": sum(group["different_layout"] for group in groups),
+    }
+
+    verb = "Would remove" if dry_run else "Removing"
+    print(
+        f"{verb} {len(to_remove)} of {len(checked)} rooms with at least {min_items} items "
+        f"({len(groups)} groups, one room kept per group and room type): {summary['removed_per_room_type']}"
+    )
+    print(
+        f"{summary['num_groups_different_layout']} of the groups have rooms with different layouts "
+        f"(mirrored or moved items); the rest are identical."
+    )
+    if mixed_type_groups:
+        print(
+            f"{len(mixed_type_groups)} groups span several room types; "
+            f"one room is kept in each type, only extra copies within a type are removed."
+        )
+
+    if dry_run or not to_remove:
+        return summary
+
+    # The exclusion list is written first, so the rooms stay out even if
+    # something fails while deleting the local files.
+    _save_excluded_rooms(_load_excluded_rooms() | set(to_remove))
+
+    for uid in to_remove:
+        room_type = rooms[uid]["room_type"]
+        image_path = _local_room_image_path(cache_dir, room_type, uid)
+        if os.path.exists(image_path):
+            os.remove(image_path)
+
+    all_local_rooms, items = _load_local_metadata(cache_dir)
+    if all_local_rooms:
+        _save_local_metadata(cache_dir, {uid: r for uid, r in all_local_rooms.items() if uid not in set(to_remove)}, items)
+
+    print(f"Added {len(to_remove)} rooms to {os.path.basename(EXCLUDED_ROOMS_PATH)}. Remember to commit it.")
+    return summary
+
+
 if __name__ == "__main__":
-    #visualize_random_rooms()
-    #download_instructscene_subset()
-    find_and_show_duplicate_rooms(num_groups=10)
+    visualize_random_rooms()
+    #find_and_show_duplicate_rooms(num_groups=10)
+    #delete_duplicate_rooms(dry_run=False)
