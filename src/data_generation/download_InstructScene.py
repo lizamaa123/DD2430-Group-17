@@ -306,6 +306,8 @@ def download_instructscene_subset(
     cache_dir=DATA_DIR,
 ):
     """
+    OBS: Takes about 40 minutes to run and 700 MB of storage. 
+
     Download only what's needed from the InstructScene version of 3D-FRONT:
     one image per room, one image per item, and compact metadata.
 
@@ -524,4 +526,4 @@ def visualize_random_rooms(
 
 if __name__ == "__main__":
     visualize_random_rooms()
-    #download_instructscene_subset(max_rooms_per_type=5)
+    #download_instructscene_subset()
