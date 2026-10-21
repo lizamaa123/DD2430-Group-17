@@ -1015,6 +1015,6 @@ def delete_duplicate_rooms(
 
 
 if __name__ == "__main__":
-    visualize_random_rooms()
+    visualize_random_rooms(room_types="diningroom")
     #find_and_show_duplicate_rooms(num_groups=10)
     #delete_duplicate_rooms(dry_run=False)
