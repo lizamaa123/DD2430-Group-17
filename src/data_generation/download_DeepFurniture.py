@@ -1,12 +1,14 @@
+import io
 import json
+import math
 import os
 import random
 import shutil
 import tarfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfFileSystem, hf_hub_download
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -16,6 +18,10 @@ REPO_ID = "byliu/DeepFurniture"
 # Where downloaded/extracted files are cached, relative to the repo root
 # (mirrors data_preprocessing.py, which also writes to data/).
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "deepfurniture")
+
+# Scratch cache for testing the "nothing downloaded yet" path. Sits next to
+# DATA_DIR so any leftover files are easy to spot; it should stay empty.
+EMPTY_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "empty_deepfurniture")
 
 NUM_FURNITURE_ARCHIVES = 25  # furnitures_0000.tar.gz .. furnitures_0024.tar.gz
 NUM_SCENE_ARCHIVES = 25  # scenes_0000.tar.gz .. scenes_0024.tar.gz
@@ -35,6 +41,10 @@ METADATA_FILES = (
 # Reading ~24k annotation files takes a while, so later runs read this one
 # file instead and only parse scenes that were added since.
 SCENE_ITEMS_CACHE = os.path.join("data", "metadata", "scene_items.json")
+
+# How much is fetched per network request when streaming an archive from the
+# Hub without downloading it (see _stream_archive_members).
+REMOTE_BLOCK_SIZE = 8 * 1024 * 1024
 
 # Scenes listed here (one scene_id per line) are treated as not existing:
 # they are never extracted, sampled or displayed. It lives next to the code,
@@ -361,7 +371,14 @@ def _ensure_scene_files(scene_id, chunk_name, cache_dir):
         filename=f"data/scenes/{chunk_name}.tar.gz",
     )
     with tarfile.open(archive_path, "r:gz") as tar:
-        members = [m for m in tar.getmembers() if m.name.startswith(f"{scene_id}/")]
+        # Same extension filter as the bulk download, so e.g. the scene's
+        # depth map (.png) is never written to disk.
+        members = [
+            m for m in tar.getmembers()
+            if m.name.startswith(f"{scene_id}/")
+            and m.isfile()
+            and m.name.lower().endswith(KEEP_EXTENSIONS["scenes"])
+        ]
         tar.extractall(path=os.path.join(cache_dir, "data", "scenes"), members=members)
 
     return image_path, annotation_path, True
@@ -400,6 +417,232 @@ def _ensure_furniture_image(furniture_id, chunk_name, cache_dir):
     return image_path, True
 
 
+def _read_metadata_json(filename, cache_dir):
+    """
+    Load one metadata JSON file (e.g. "scene_index.json"): from
+    cache_dir/data/metadata/ if it's downloaded, otherwise straight from
+    the Hub into memory, without saving anything.
+
+    Args:
+        filename: Name of the file in data/metadata/ in the dataset repo.
+        cache_dir: Local root directory data is stored under.
+
+    Returns:
+        The parsed JSON.
+    """
+    local_path = os.path.join(cache_dir, "data", "metadata", filename)
+    if os.path.exists(local_path):
+        with open(local_path) as f:
+            return json.load(f)
+    with HfFileSystem().open(f"datasets/{REPO_ID}/data/metadata/{filename}", "rb") as f:
+        return json.load(f)
+
+
+def _stream_archive_members(subfolder, chunk_name, wanted, max_members=None):
+    """
+    Read selected files out of one archive on the Hub without downloading
+    it to disk: the archive is streamed and decompressed in memory, and
+    only the wanted members are kept.
+
+    A .tar.gz can't be read at random positions, so everything up to the
+    last wanted member is still transferred over the network (each archive
+    is roughly 1-2 GB). Reading stops as soon as max_members have been
+    found.
+
+    Args:
+        subfolder: "scenes" or "furnitures".
+        chunk_name: Archive name without extension, e.g. "scenes_0003".
+        wanted: Function taking a member name (e.g. "SCENEID/image.jpg")
+            and returning a key to store it under, or None to skip it.
+        max_members: Stop after this many wanted members (None reads the
+            whole archive).
+
+    Returns:
+        Dict mapping each key returned by wanted to that member's bytes.
+    """
+    found = {}
+    path = f"datasets/{REPO_ID}/data/{subfolder}/{chunk_name}.tar.gz"
+    with HfFileSystem().open(path, "rb", block_size=REMOTE_BLOCK_SIZE) as f:
+        with tarfile.open(fileobj=f, mode="r|gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                key = wanted(member.name)
+                if key is None:
+                    continue
+                found[key] = tar.extractfile(member).read()
+                if max_members is not None and len(found) >= max_members:
+                    break
+    return found
+
+
+def _read_scene_items_from_hub(num_workers=8, num_archives=None):
+    """
+    Read every scene's item list (see _compact_instances) straight from
+    the scene archives on the Hub into memory. Nothing is saved, but all
+    scene archives are streamed (~42 GB over the network), so this is slow;
+    it exists so the analysis functions also work with no data downloaded.
+    Excluded scenes (EXCLUDED_SCENES_PATH) are left out.
+
+    Args:
+        num_workers: Number of archives streamed in parallel.
+        num_archives: Only read this many of the scene archives (each
+            holds ~1,000 scenes), e.g. 1 for a quick test. None reads all.
+
+    Returns:
+        Dict mapping scene_id to its list of instances.
+    """
+    chunk_names = [f"scenes_{i:04d}" for i in range(NUM_SCENE_ARCHIVES)]
+    if num_archives is not None:
+        chunk_names = chunk_names[:num_archives]
+    excluded = _load_excluded_scenes()
+
+    def wanted(name):
+        scene_id, _, filename = name.partition("/")
+        return scene_id if filename == "annotation.json" and scene_id not in excluded else None
+
+    def read_archive(chunk_name):
+        members = _stream_archive_members("scenes", chunk_name, wanted)
+        return {scene_id: _compact_instances(json.loads(data)) for scene_id, data in members.items()}
+
+    print(f"Streaming {len(chunk_names)} scene archives from the Hub (nothing is saved; this takes a while).")
+    scenes = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(num_workers, len(chunk_names)))) as executor:
+        for result in tqdm(executor.map(read_archive, chunk_names), total=len(chunk_names), desc="Scene archives"):
+            scenes.update(result)
+    return dict(sorted(scenes.items()))
+
+
+def _load_display_images(scene_ids, furniture_ids, cache_dir):
+    """
+    Load the images needed for a plot. Images that are downloaded are read
+    from disk; the rest are read from the Hub into memory, streaming each
+    archive involved only once and saving nothing.
+
+    Args:
+        scene_ids: Scenes whose room image is needed.
+        furniture_ids: Items whose image is needed.
+        cache_dir: Local root directory data is stored under.
+
+    Returns:
+        Tuple (scene_images, furniture_images): dicts mapping IDs to PIL
+        images. IDs whose image can't be found are left out.
+    """
+    scene_images, furniture_images = {}, {}
+    missing_scenes, missing_items = [], []
+
+    for scene_id in scene_ids:
+        path = os.path.join(cache_dir, "data", "scenes", scene_id, "image.jpg")
+        if os.path.exists(path):
+            scene_images[scene_id] = Image.open(path)
+        else:
+            missing_scenes.append(scene_id)
+    for furniture_id in furniture_ids:
+        path = os.path.join(cache_dir, "data", "furnitures", f"{furniture_id}.jpg")
+        if os.path.exists(path):
+            furniture_images[furniture_id] = Image.open(path)
+        else:
+            missing_items.append(furniture_id)
+
+    if missing_scenes:
+        chunk_by_id = {s["scene_id"]: s["chunk_name"] for s in _read_metadata_json("scene_index.json", cache_dir)["scenes"]}
+        by_chunk = defaultdict(set)
+        for scene_id in missing_scenes:
+            if scene_id in chunk_by_id:
+                by_chunk[chunk_by_id[scene_id]].add(scene_id)
+        for chunk_name, ids in sorted(by_chunk.items()):
+            print(f"Reading {len(ids)} scene image(s) from {chunk_name} on the Hub...")
+            wanted = lambda name, ids=ids: name.split("/")[0] if name.endswith("/image.jpg") and name.split("/")[0] in ids else None
+            for scene_id, data in _stream_archive_members("scenes", chunk_name, wanted, len(ids)).items():
+                scene_images[scene_id] = Image.open(io.BytesIO(data))
+
+    if missing_items:
+        chunk_by_id = {
+            f["furniture_id"]: f["chunk_name"] for f in _read_metadata_json("furniture_index.json", cache_dir)["furnitures"]
+        }
+        by_chunk = defaultdict(set)
+        for furniture_id in missing_items:
+            if furniture_id in chunk_by_id:
+                by_chunk[chunk_by_id[furniture_id]].add(furniture_id)
+        for chunk_name, ids in sorted(by_chunk.items()):
+            print(f"Reading {len(ids)} item image(s) from {chunk_name} on the Hub...")
+            wanted = lambda name, ids=ids: name[: -len(".jpg")] if name.endswith(".jpg") and name[: -len(".jpg")] in ids else None
+            for furniture_id, data in _stream_archive_members("furnitures", chunk_name, wanted, len(ids)).items():
+                furniture_images[furniture_id] = Image.open(io.BytesIO(data))
+
+    for image in list(scene_images.values()) + list(furniture_images.values()):
+        image.load()
+    return scene_images, furniture_images
+
+
+def _show_panels(images, labels, title, max_cols=7):
+    """
+    Show images in a grid (at most max_cols per row), each with its label
+    above it, and a title over the whole figure.
+
+    Args:
+        images: List of PIL images.
+        labels: List of str, one per image.
+        title: Figure title.
+        max_cols: Max images per row.
+
+    Returns:
+        None.
+    """
+    num_panels = len(images)
+    num_cols = min(max_cols, num_panels)
+    num_rows = -(-num_panels // num_cols)  # ceil division
+
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows))
+    axes = [axes] if num_panels == 1 else axes.flatten()
+    for ax, image, label in zip(axes, images, labels):
+        ax.imshow(image)
+        ax.set_title(label)
+        ax.axis("off")
+    # Hide any unused panels left over in the last row.
+    for ax in axes[num_panels:]:
+        ax.axis("off")
+    fig.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def _remove_downloaded_metadata(cache_dir, repo_relative_paths):
+    """
+    Delete metadata files that were fetched just now (plus the Hugging Face
+    bookkeeping next to them), then remove every folder under cache_dir that
+    ends up empty - including cache_dir itself. Files that were already
+    there are never passed in, so existing data is left alone.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+        repo_relative_paths: Repo-relative paths of the files to delete,
+            e.g. ["data/metadata/scene_index.json"].
+
+    Returns:
+        None.
+    """
+    for rel_path in repo_relative_paths:
+        for path in (
+            os.path.join(cache_dir, rel_path),
+            os.path.join(cache_dir, ".cache", "huggingface", "download", rel_path + ".metadata"),
+            os.path.join(cache_dir, ".cache", "huggingface", "download", rel_path + ".lock"),
+        ):
+            if os.path.exists(path):
+                os.remove(path)
+
+    # Files that don't count as data: macOS Finder droppings, and the
+    # boilerplate huggingface_hub writes into .cache/huggingface/.
+    junk = {".DS_Store", ".gitignore", "CACHEDIR.TAG"}
+    for root, dirs, files in os.walk(cache_dir, topdown=False):
+        in_hf_cache = os.sep + ".cache" in root + os.sep or root.endswith(".cache")
+        for name in files:
+            if name == ".DS_Store" or (in_hf_cache and name in junk):
+                os.remove(os.path.join(root, name))
+        if not os.listdir(root):
+            os.rmdir(root)
+
+
 def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
     """
     Sanity-check the downloaded/extracted data by displaying random scenes
@@ -408,9 +651,9 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
 
     Works whether or not the data is already downloaded: anything already
     present under cache_dir is used as-is; anything missing is fetched
-    just for that one scene/item and deleted again once displayed, so
-    running this against an empty cache_dir doesn't leave a partial
-    dataset behind, and running it against a fully downloaded cache_dir
+    just for that one scene/item (and the metadata index files) and deleted
+    again once displayed, so running this against an empty cache_dir leaves
+    nothing behind, and running it against a fully downloaded cache_dir
     never re-downloads anything.
 
     This is a visualization/debugging aid for checking that the data
@@ -428,6 +671,11 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
         None.
     """
     rng = random.Random(seed)
+
+    # Remember which index files had to be fetched, so they can be removed
+    # again at the end (they're ~6 MB, not worth keeping for a one-off check).
+    index_paths = ["data/metadata/scene_index.json", "data/metadata/furniture_index.json"]
+    fetched_index_paths = [p for p in index_paths if not os.path.exists(os.path.join(cache_dir, p))]
 
     with open(_ensure_local_file("data/metadata/scene_index.json", cache_dir)) as f:
         scene_index = json.load(f)["scenes"]
@@ -496,12 +744,15 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
         # visualization run against an empty cache_dir leaves it empty
         # again afterward.
         if scene_was_downloaded:
-            os.remove(image_path)
-            os.remove(annotation_path)
-            os.rmdir(os.path.dirname(image_path))
+            # Remove the whole scene folder, not just the two files we read,
+            # so nothing else extracted alongside them is left behind.
+            shutil.rmtree(os.path.dirname(image_path), ignore_errors=True)
         for item_path, item_was_downloaded in item_cleanup:
             if item_was_downloaded:
                 os.remove(item_path)
+
+    if fetched_index_paths:
+        _remove_downloaded_metadata(cache_dir, fetched_index_paths)
 
 
 def _compact_instances(annotation):
@@ -532,7 +783,7 @@ def _compact_instances(annotation):
     return instances
 
 
-def _load_scene_items(cache_dir, num_workers=8):
+def _load_local_scene_items(cache_dir, num_workers=8):
     """
     Load the item list of every scene downloaded to cache_dir, using the
     SCENE_ITEMS_CACHE file where possible and parsing only the scenes it
@@ -586,6 +837,33 @@ def _load_scene_items(cache_dir, num_workers=8):
             json.dump({scene_id: cached[scene_id] for scene_id in sorted(cached)}, f)
 
     return {scene_id: cached[scene_id] for scene_id in on_disk}
+
+
+def _load_scene_items(cache_dir, use_local=True, num_workers=8, hub_scene_archives=None):
+    """
+    Get every scene's item list, from downloaded data if there is any (and
+    use_local is True), otherwise straight from the Hub into memory
+    (_read_scene_items_from_hub; slow, nothing is saved). Excluded scenes
+    are left out either way.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+        use_local: Whether to use downloaded data when there is some. Set
+            False to test the no-download path even with data on disk.
+        num_workers: Threads for reading annotation files or archives.
+        hub_scene_archives: When reading from the Hub, only read this many
+            scene archives (~1,000 scenes each), e.g. 1 for a quick test.
+            None reads all. Ignored for downloaded data.
+
+    Returns:
+        Dict mapping scene_id to its list of instances (see
+        _compact_instances).
+    """
+    if use_local:
+        scenes = _load_local_scene_items(cache_dir, num_workers)
+        if scenes:
+            return scenes
+    return _read_scene_items_from_hub(num_workers, hub_scene_archives)
 
 
 def _items_key(instances):
@@ -698,6 +976,8 @@ def find_and_show_duplicate_scenes(
     same_view_iou=0.5,
     only_different_views=False,
     largest_first=False,
+    use_local=True,
+    hub_scene_archives=None,
     num_workers=8,
     cache_dir=DATA_DIR,
     seed=None,
@@ -723,11 +1003,12 @@ def find_and_show_duplicate_scenes(
     divided by total area of two boxes, from 0 = no overlap to 1 =
     identical; see _box_iou).
 
-    Only downloaded scenes are checked (see download_deepfurniture_subset).
-    The first run reads every scene's annotation.json, which takes a few
-    minutes; later runs use the SCENE_ITEMS_CACHE file. Images of scenes
-    and items that aren't on disk are fetched from the Hub for display and
-    deleted again afterward, as in visualize_random_scenes.
+    Works whether or not the data is downloaded. With downloaded scenes,
+    the first run reads every scene's annotation.json, which takes a while;
+    later runs use the SCENE_ITEMS_CACHE file. With nothing downloaded (or
+    use_local=False), every scene is read from the Hub into memory, which
+    is slow (all scene archives are streamed) but saves nothing. Images
+    that aren't on disk are read from the Hub into memory for display.
 
     Args:
         num_groups: How many duplicate groups to display.
@@ -750,6 +1031,11 @@ def find_and_show_duplicate_scenes(
             and the displayed groups) then covers only those groups.
         largest_first: If True, display the groups with the most scenes
             instead of random ones (seed is then ignored).
+        use_local: Whether to use downloaded data when there is some. Set
+            False to read everything from the Hub.
+        hub_scene_archives: When reading from the Hub, only read this many
+            of the 25 scene archives (~1,000 scenes each), e.g. 1 for a
+            quick test. None reads all.
         num_workers: Number of threads used when reading annotation files.
         cache_dir: Local root directory data is stored under. Defaults
             to data/deepfurniture/ at the repo root.
@@ -770,13 +1056,7 @@ def find_and_show_duplicate_scenes(
             union, of a scene with the group's first scene) and
             "same_view".
     """
-    scenes = _load_scene_items(cache_dir, num_workers)
-    if not scenes:
-        raise FileNotFoundError(
-            f"No downloaded scenes found under {os.path.join(cache_dir, 'data', 'scenes')}. "
-            "Run download_deepfurniture_subset first."
-        )
-
+    scenes = _load_scene_items(cache_dir, use_local, num_workers, hub_scene_archives)
     checked, scene_id_groups = _find_duplicate_groups(scenes, min_items)
 
     groups = []
@@ -811,88 +1091,44 @@ def find_and_show_duplicate_scenes(
     if not shown:
         return summary
 
-    with open(_ensure_local_file("data/metadata/scene_index.json", cache_dir)) as f:
-        scene_chunk_by_id = {s["scene_id"]: s["chunk_name"] for s in json.load(f)["scenes"]}
-    with open(_ensure_local_file("data/metadata/furniture_index.json", cache_dir)) as f:
-        furniture_chunk_by_id = {item["furniture_id"]: item["chunk_name"] for item in json.load(f)["furnitures"]}
-
     for number, group in enumerate(shown, start=1):
         group_scene_ids = group["scene_ids"][:scenes_per_group]
         first = checked[group_scene_ids[0]]
 
-        images, labels = [], []
-        cleanup = []  # files fetched only for this display, deleted afterward
+        # One panel per distinct item, labelled with how often it appears.
+        counts = Counter(instance["furniture_id"] for instance in first)
+        info_by_id = {instance["furniture_id"]: instance for instance in first}
+        scene_images, furniture_images = _load_display_images(group_scene_ids, sorted(counts), cache_dir)
 
+        images, labels = [], []
         for scene_id in group_scene_ids:
-            image_path, annotation_path, was_downloaded = _ensure_scene_files(
-                scene_id, scene_chunk_by_id[scene_id], cache_dir
-            )
-            image = Image.open(image_path)
-            image.load()
-            images.append(image)
+            if scene_id not in scene_images:
+                continue
             if scene_id == group_scene_ids[0]:
                 view_label = "reference view"
             else:
                 view_label = f"box IoU with first: {_view_similarity(first, checked[scene_id]):.2f}"
+            images.append(scene_images[scene_id])
             labels.append(f"Scene {scene_id[:12]}\n{view_label}")
-            if was_downloaded:
-                cleanup += [image_path, annotation_path]
-
-        # One panel per distinct item, labelled with how often it appears.
-        counts = defaultdict(int)
-        info_by_id = {}
-        for instance in first:
-            counts[instance["furniture_id"]] += 1
-            info_by_id.setdefault(instance["furniture_id"], instance)
 
         for furniture_id in sorted(counts):
-            chunk_name = furniture_chunk_by_id.get(furniture_id)
-            if chunk_name is None:
-                continue  # not in the metadata index; skip rather than guess
-            item_path, was_downloaded = _ensure_furniture_image(furniture_id, chunk_name, cache_dir)
-            image = Image.open(item_path)
-            image.load()
-            if was_downloaded:
-                cleanup.append(item_path)
-
+            if furniture_id not in furniture_images:
+                continue  # no image for this item; skip rather than guess
             info = info_by_id[furniture_id]
             styles = ", ".join(info["styles"]) or "unknown style"
             count = f" x{counts[furniture_id]}" if counts[furniture_id] > 1 else ""
-            images.append(image)
+            images.append(furniture_images[furniture_id])
             labels.append(f"{info['category']}{count}\n({styles})")
-
-        max_cols = 7
-        num_panels = len(images)
-        num_cols = min(max_cols, num_panels)
-        num_rows = -(-num_panels // num_cols)  # ceil division
-
-        fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows))
-        axes = [axes] if num_panels == 1 else axes.flatten()
-
-        for ax, image, label in zip(axes, images, labels):
-            ax.imshow(image)
-            ax.set_title(label)
-            ax.axis("off")
-        for ax in axes[num_panels:]:
-            ax.axis("off")
 
         view = "same view" if group["same_view"] else "different views"
         cut_off = f", showing {len(group_scene_ids)}" if len(group["scene_ids"]) > len(group_scene_ids) else ""
-        fig.suptitle(
+        _show_panels(
+            images,
+            labels,
             f"Group {number}: {len(group['scene_ids'])} scenes with identical items "
             f"({view}, min box IoU {group['min_view_iou']:.2f}{cut_off}). "
             f"Scenes first, then the shared items.",
-            fontsize=14,
         )
-        plt.tight_layout()
-        plt.show()
-
-        for path in cleanup:
-            os.remove(path)
-        for path in cleanup:
-            folder = os.path.dirname(path)
-            if os.path.basename(os.path.dirname(folder)) == "scenes" and os.path.isdir(folder) and not os.listdir(folder):
-                os.rmdir(folder)
 
     return summary
 
@@ -900,6 +1136,7 @@ def find_and_show_duplicate_scenes(
 def delete_duplicate_scenes(
     min_items=3,
     dry_run=True,
+    use_local=True,
     num_workers=8,
     cache_dir=DATA_DIR,
 ):
@@ -929,14 +1166,17 @@ def delete_duplicate_scenes(
          same items.
 
     Which scenes are duplicates is decided from the whole dataset, so the
-    result is the same on every machine. Deleting therefore requires every
-    scene in scene_index.json (apart from already excluded ones) to be
-    downloaded; a dry run works on whatever is downloaded and says what's
-    missing.
+    result is the same on every machine: downloaded data is only used if
+    it covers every scene in scene_index.json (apart from already excluded
+    ones); otherwise every scene is read from the Hub into memory (slow,
+    nothing is saved), and only the exclusion list is updated for scenes
+    that aren't downloaded.
 
     Args:
         min_items: Scenes with fewer items than this are ignored.
         dry_run: If True, change nothing and only report.
+        use_local: Whether to use downloaded data when it covers every
+            scene. Set False to always read from the Hub.
         num_workers: Number of threads used when reading annotation files
             that aren't in the SCENE_ITEMS_CACHE file yet.
         cache_dir: Local root directory data is stored under. Defaults
@@ -953,27 +1193,17 @@ def delete_duplicate_scenes(
           - "groups": list of dicts with "keep" and "remove" (list of
             scene_ids).
     """
-    scenes = _load_scene_items(cache_dir, num_workers)
-    if not scenes:
-        raise FileNotFoundError(
-            f"No downloaded scenes found under {os.path.join(cache_dir, 'data', 'scenes')}. "
-            "Run download_deepfurniture_subset first."
-        )
+    all_scene_ids = {scene["scene_id"] for scene in _read_metadata_json("scene_index.json", cache_dir)["scenes"]}
+    expected = all_scene_ids - _load_excluded_scenes()
 
-    with open(_ensure_local_file("data/metadata/scene_index.json", cache_dir)) as f:
-        all_scene_ids = {scene["scene_id"] for scene in json.load(f)["scenes"]}
-    missing = all_scene_ids - _load_excluded_scenes() - set(scenes)
-    if missing:
-        message = (
-            f"{len(missing)} of the dataset's scenes aren't downloaded, so duplicates involving "
-            "them can't be found."
-        )
-        if not dry_run:
-            raise RuntimeError(
-                f"{message} Download all scenes (download_deepfurniture_subset) before deleting, "
-                "so the excluded list is the same on every machine."
+    scenes = _load_local_scene_items(cache_dir, num_workers) if use_local else {}
+    if not (scenes and expected <= set(scenes)):
+        if scenes:
+            print(
+                f"{len(expected - set(scenes))} scenes aren't downloaded, so reading all scenes "
+                "from the Hub instead."
             )
-        print(f"{message} Showing what would happen for the downloaded scenes only.")
+        scenes = _read_scene_items_from_hub(num_workers)
 
     checked, scene_id_groups = _find_duplicate_groups(scenes, min_items)
     groups = [{"keep": scene_ids[0], "remove": scene_ids[1:]} for scene_ids in scene_id_groups]
@@ -1021,6 +1251,389 @@ def delete_duplicate_scenes(
     return summary
 
 
+def _item_overlap(items_a, items_b):
+    """
+    How much two scenes' items overlap: the number of distinct items they
+    share divided by the number of distinct items in either scene. This is
+    the same intersection-over-union idea as the box IoU (see _box_iou),
+    applied to sets of item IDs instead of areas (also called the Jaccard
+    index). How often an item repeats within a scene is ignored.
+
+        overlap = |A ∩ B| / |A ∪ B|
+
+    1 means the same set of items, 0 means no items in common. Example:
+    scenes with 8 and 7 distinct items that share 6 overlap
+    6 / (8 + 7 - 6) = 0.67.
+
+    Args:
+        items_a, items_b: Sets of furniture IDs.
+
+    Returns:
+        float in [0, 1].
+    """
+    union = len(items_a | items_b)
+    return len(items_a & items_b) / union if union else 0.0
+
+
+def _find_similar_pairs(scenes, min_overlap, min_items):
+    """
+    Find every pair of scenes whose item overlap (see _item_overlap) is at
+    least min_overlap. Scenes with fewer than min_items items are ignored.
+
+    Comparing all ~190 million pairs directly would be slow, so this uses
+    prefix filtering (Bayardo et al., "Scaling up all pairs similarity
+    search", WWW 2007): with each scene's items sorted from rarest to most
+    common, two scenes can only reach the threshold if they share an item
+    among the first |A| - ceil(min_overlap * |A|) + 1 of either scene. Only
+    such candidate pairs are compared, and the result is exact.
+
+    Args:
+        scenes: Dict mapping scene_id to its list of instances.
+        min_overlap: Threshold in (0, 1].
+        min_items: Scenes with fewer items (instances) than this are ignored.
+
+    Returns:
+        List of (overlap, scene_id_a, scene_id_b) tuples, scene_id_a <
+        scene_id_b.
+    """
+    if not 0 < min_overlap <= 1:
+        raise ValueError(f"min_overlap must be in (0, 1], got {min_overlap}")
+
+    item_sets = {
+        scene_id: frozenset(instance["furniture_id"] for instance in instances)
+        for scene_id, instances in scenes.items()
+        if len(instances) >= min_items
+    }
+    frequency = Counter(item for items in item_sets.values() for item in items)
+
+    index = defaultdict(list)  # item -> scenes having it in their prefix
+    candidates = set()
+    for scene_id in sorted(item_sets):
+        items = sorted(item_sets[scene_id], key=lambda item: (frequency[item], item))
+        prefix_length = len(items) - math.ceil(min_overlap * len(items) - 1e-9) + 1
+        for item in items[:prefix_length]:
+            for other in index[item]:
+                candidates.add((other, scene_id))
+            index[item].append(scene_id)
+
+    pairs = []
+    for scene_a, scene_b in candidates:
+        overlap = _item_overlap(item_sets[scene_a], item_sets[scene_b])
+        if overlap >= min_overlap:
+            pairs.append((overlap, scene_a, scene_b))
+    pairs.sort(key=lambda pair: (pair[1], pair[2]))
+    return pairs
+
+
+def _connected_groups(pairs):
+    """
+    Turn pairs of similar scenes into groups: two scenes end up in the same
+    group if they are linked by a chain of similar pairs (connected
+    components). These are the groups to keep on one side of a train/test
+    split.
+
+    Args:
+        pairs: Iterable of (overlap, scene_id_a, scene_id_b).
+
+    Returns:
+        List of sorted lists of scene_ids, largest group first.
+    """
+    parent = {}
+
+    def find(scene_id):
+        parent.setdefault(scene_id, scene_id)
+        while parent[scene_id] != scene_id:
+            parent[scene_id] = parent[parent[scene_id]]
+            scene_id = parent[scene_id]
+        return scene_id
+
+    for _, scene_a, scene_b in pairs:
+        root_a, root_b = find(scene_a), find(scene_b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    groups = defaultdict(list)
+    for scene_id in parent:
+        groups[find(scene_id)].append(scene_id)
+    return sorted((sorted(group) for group in groups.values()), key=lambda group: (-len(group), group[0]))
+
+
+def find_and_show_similar_scenes(
+    num_pairs=3,
+    min_overlap=0.7,
+    max_overlap=1.0,
+    min_items=3,
+    use_local=True,
+    hub_scene_archives=None,
+    num_workers=8,
+    cache_dir=DATA_DIR,
+    seed=None,
+):
+    """
+    Find near-identical scenes: pairs that share most, but not necessarily
+    all, of their items, e.g. the same room seen from another angle (some
+    items are out of view) or with one item swapped. Display a few pairs
+    and return how many there are. Nothing is deleted or changed.
+
+    Exact duplicates are handled by find_and_show_duplicate_scenes and
+    delete_duplicate_scenes; this catches what they miss. These scenes are
+    real data, so rather than deleting them they should be kept on the same
+    side of a train/test split; the returned "groups" are meant for that.
+
+    Similarity is the item overlap (see _item_overlap): distinct items
+    shared divided by distinct items in either scene, from 0 (nothing in
+    common) to 1 (the same set of items).
+
+    Each displayed pair shows the two scene images, then their items in
+    three blocks: shared by both, only in the first scene, only in the
+    second.
+
+    Works whether or not the data is downloaded, like
+    find_and_show_duplicate_scenes.
+
+    Args:
+        num_pairs: How many random pairs to display.
+        min_overlap: Lowest item overlap that counts as similar, in (0, 1].
+        max_overlap: Only display pairs with at most this overlap. Use it
+            to look at a band, e.g. 0.5 to 0.6, when choosing a threshold.
+            The counts and groups ignore it.
+        min_items: Scenes with fewer items than this are ignored, because
+            small scenes overlap a lot by coincidence.
+        use_local: Whether to use downloaded data when there is some. Set
+            False to read everything from the Hub.
+        hub_scene_archives: When reading from the Hub, only read this many
+            of the 25 scene archives, e.g. 1 for a quick test. None reads
+            all.
+        num_workers: Number of threads used when reading annotation files.
+        cache_dir: Local root directory data is stored under. Defaults
+            to data/deepfurniture/ at the repo root.
+        seed: Optional random seed, for reproducible choice of pairs.
+
+    Returns:
+        dict with:
+          - "num_scenes_checked": scenes with at least min_items items.
+          - "num_pairs": pairs with overlap >= min_overlap.
+          - "num_scenes_in_pairs": scenes that are similar to at least
+            one other scene.
+          - "groups": lists of scene_ids linked by chains of similar
+            pairs, largest first (see _connected_groups).
+          - "pairs": list of (overlap, scene_id_a, scene_id_b).
+    """
+    scenes = _load_scene_items(cache_dir, use_local, num_workers, hub_scene_archives)
+    pairs = _find_similar_pairs(scenes, min_overlap, min_items)
+    groups = _connected_groups(pairs)
+    num_checked = sum(len(instances) >= min_items for instances in scenes.values())
+
+    summary = {
+        "num_scenes_checked": num_checked,
+        "num_pairs": len(pairs),
+        "num_scenes_in_pairs": sum(len(group) for group in groups),
+        "groups": groups,
+        "pairs": pairs,
+    }
+    print(
+        f"{summary['num_pairs']} pairs of scenes with item overlap >= {min_overlap}; "
+        f"{summary['num_scenes_in_pairs']} of {num_checked} scenes with at least {min_items} items "
+        f"are in one, forming {len(groups)} groups (largest: {len(groups[0]) if groups else 0} scenes)."
+    )
+
+    in_band = [pair for pair in pairs if pair[0] <= max_overlap]
+    shown = random.Random(seed).sample(in_band, k=min(num_pairs, len(in_band)))
+    if not shown:
+        return summary
+
+    for number, (overlap, scene_a, scene_b) in enumerate(shown, start=1):
+        info_by_id = {instance["furniture_id"]: instance for instance in scenes[scene_a] + scenes[scene_b]}
+        items_a = {instance["furniture_id"] for instance in scenes[scene_a]}
+        items_b = {instance["furniture_id"] for instance in scenes[scene_b]}
+        blocks = [
+            ("both", sorted(items_a & items_b)),
+            ("only in A", sorted(items_a - items_b)),
+            ("only in B", sorted(items_b - items_a)),
+        ]
+        scene_images, furniture_images = _load_display_images([scene_a, scene_b], sorted(items_a | items_b), cache_dir)
+
+        images, labels = [], []
+        for name, scene_id in (("A", scene_a), ("B", scene_b)):
+            if scene_id in scene_images:
+                images.append(scene_images[scene_id])
+                labels.append(f"Scene {name}: {scene_id[:12]}\n{len(scenes[scene_id])} items")
+        for block, furniture_ids in blocks:
+            for furniture_id in furniture_ids:
+                if furniture_id not in furniture_images:
+                    continue
+                info = info_by_id[furniture_id]
+                images.append(furniture_images[furniture_id])
+                labels.append(f"[{block}] {info['category']}\n({', '.join(info['styles']) or 'unknown style'})")
+
+        _show_panels(
+            images,
+            labels,
+            f"Pair {number}: item overlap {overlap:.2f} ({len(blocks[0][1])} shared, "
+            f"{len(blocks[1][1])} only in A, {len(blocks[2][1])} only in B). Scenes first, then the items.",
+        )
+
+    return summary
+
+
+def show_dataset_statistics(
+    min_items=3,
+    use_local=True,
+    hub_scene_archives=None,
+    num_workers=8,
+    cache_dir=DATA_DIR,
+):
+    """
+    Print and plot summary statistics of the scenes (excluded scenes left
+    out), to see what the data looks like before modelling:
+
+      - scene size: how many scenes have each number of items,
+      - items per category,
+      - item popularity: in how many scenes each item appears (most items
+        appear in very few scenes - the long tail),
+      - style labels per item instance, including how many have none,
+      - near-identical scenes: how many scenes share at least 50 / 70 / 90 %
+        of their items with another scene (see find_and_show_similar_scenes).
+
+    Item counts per scene count every instance (two identical chairs are 2
+    items), as in the annotations.
+
+    Works whether or not the data is downloaded, like
+    find_and_show_duplicate_scenes.
+
+    Args:
+        min_items: Scenes with fewer items than this are left out of the
+            near-identical counts (as in find_and_show_similar_scenes); all
+            other statistics cover every scene.
+        use_local: Whether to use downloaded data when there is some. Set
+            False to read everything from the Hub.
+        hub_scene_archives: When reading from the Hub, only read this many
+            of the 25 scene archives, e.g. 1 for a quick test. None reads
+            all.
+        num_workers: Number of threads used when reading annotation files.
+        cache_dir: Local root directory data is stored under. Defaults
+            to data/deepfurniture/ at the repo root.
+
+    Returns:
+        dict with the numbers behind the plots: "num_scenes",
+        "num_instances", "num_distinct_items", "scene_sizes" (size -> number
+        of scenes), "instances_per_category", "scenes_per_item_buckets",
+        "instances_per_style" (an instance with several styles counts once
+        per style; "(none)" counts instances without one),
+        "num_scenes_with_repeated_item", "most_common_items" (top 10, as
+        (furniture_id, category, number of scenes)) and
+        "near_identical_scenes" (overlap threshold -> number of scenes).
+    """
+    scenes = _load_scene_items(cache_dir, use_local, num_workers, hub_scene_archives)
+    instances = [instance for scene in scenes.values() for instance in scene]
+
+    scene_sizes = Counter(len(scene) for scene in scenes.values())
+    per_category = Counter(instance["category"] for instance in instances)
+    scenes_per_item = Counter(
+        furniture_id for scene in scenes.values() for furniture_id in {i["furniture_id"] for i in scene}
+    )
+    category_by_item = {instance["furniture_id"]: instance["category"] for instance in instances}
+    per_style = Counter(style for instance in instances for style in instance["styles"])
+    per_style["(none)"] = sum(not instance["styles"] for instance in instances)
+    repeated = sum(len(scene) != len({i["furniture_id"] for i in scene}) for scene in scenes.values())
+
+    buckets = [("1", 1, 1), ("2", 2, 2), ("3-4", 3, 4), ("5-9", 5, 9), ("10-49", 10, 49), ("50+", 50, math.inf)]
+    per_bucket = {name: sum(low <= n <= high for n in scenes_per_item.values()) for name, low, high in buckets}
+
+    pairs = _find_similar_pairs(scenes, 0.5, min_items)
+    best_overlap = defaultdict(float)
+    for overlap, scene_a, scene_b in pairs:
+        best_overlap[scene_a] = max(best_overlap[scene_a], overlap)
+        best_overlap[scene_b] = max(best_overlap[scene_b], overlap)
+    near_identical = {t: sum(o >= t for o in best_overlap.values()) for t in (0.5, 0.7, 0.9)}
+
+    stats = {
+        "num_scenes": len(scenes),
+        "num_instances": len(instances),
+        "num_distinct_items": len(scenes_per_item),
+        "scene_sizes": dict(sorted(scene_sizes.items())),
+        "instances_per_category": dict(per_category.most_common()),
+        "scenes_per_item_buckets": per_bucket,
+        "instances_per_style": dict(per_style.most_common()),
+        "num_scenes_with_repeated_item": repeated,
+        "most_common_items": [
+            (furniture_id, category_by_item[furniture_id], n) for furniture_id, n in scenes_per_item.most_common(10)
+        ],
+        "near_identical_scenes": near_identical,
+    }
+
+    sizes = list(scene_sizes.elements())
+    print(f"Scenes: {len(scenes)}, item instances: {len(instances)}, distinct items: {len(scenes_per_item)}")
+    print(
+        f"Items per scene: median {sorted(sizes)[len(sizes) // 2]}, min {min(sizes)}, max {max(sizes)}; "
+        f"{sum(n < 5 for n in sizes)} scenes have fewer than 5"
+    )
+    print(f"Scenes with the same item more than once: {repeated} ({repeated / len(scenes):.0%})")
+    print(f"Items in only one scene: {per_bucket['1']} of {len(scenes_per_item)}")
+    print(f"Item instances without a style: {per_style['(none)']} ({per_style['(none)'] / len(instances):.0%})")
+    print("Most common items (scenes):", ", ".join(f"{c} {f} ({n})" for f, c, n in stats["most_common_items"][:5]))
+    print(
+        "Scenes sharing at least 50 / 70 / 90 % of their items with another scene: "
+        + " / ".join(str(near_identical[t]) for t in (0.5, 0.7, 0.9))
+    )
+
+    # One series per chart, so one color; numbers live in the axes and the
+    # printout above rather than on every bar.
+    color, ink, grid = "#2a78d6", "#52514e", "#e6e5e1"
+
+    def style_axes(ax, title, xlabel, ylabel, horizontal=False):
+        ax.set_title(title, loc="left", fontsize=12)
+        ax.set_xlabel(xlabel, color=ink)
+        ax.set_ylabel(ylabel, color=ink)
+        ax.grid(axis="x" if horizontal else "y", color=grid, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(colors=ink)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
+
+    ax = axes[0]
+    ax.bar(list(scene_sizes), list(scene_sizes.values()), color=color, width=0.8)
+    style_axes(ax, "Scene size", "Items in the scene", "Scenes")
+
+    ax = axes[1]
+    names = [name for name, _ in per_category.most_common()][::-1]
+    ax.barh(names, [per_category[n] for n in names], color=color, height=0.7)
+    style_axes(ax, "Items per category", "Item instances", "", horizontal=True)
+
+    ax = axes[2]
+    ax.bar(list(per_bucket), list(per_bucket.values()), color=color, width=0.7)
+    style_axes(ax, "Item popularity (long tail)", "Number of scenes the item appears in", "Distinct items")
+
+    ax = axes[3]
+    names = [name for name, _ in per_style.most_common()][::-1]
+    ax.barh(names, [per_style[n] for n in names], color=color, height=0.7)
+    style_axes(ax, "Style labels", "Item instances", "", horizontal=True)
+
+    ax = axes[4]
+    labels = [f">= {int(t * 100)} %" for t in near_identical]
+    ax.bar(labels, list(near_identical.values()), color=color, width=0.6)
+    style_axes(ax, "Near-identical scenes", "Shares at least this share of its items with another scene", "Scenes")
+
+    ax = axes[5]
+    top = stats["most_common_items"][::-1]
+    ax.barh([f"{c} {f}" for f, c, _ in top], [n for _, _, n in top], color=color, height=0.7)
+    style_axes(ax, "Most common items", "Scenes the item appears in", "", horizontal=True)
+
+    fig.suptitle(f"DeepFurniture: {len(scenes)} scenes, {len(scenes_per_item)} distinct items", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    return stats
+
+
 if __name__ == "__main__":
-    #visualize_random_scenes()
-    find_and_show_duplicate_scenes(num_groups=3)
+    visualize_random_scenes(cache_dir=EMPTY_DATA_DIR)
+    #find_and_show_duplicate_scenes(num_groups=3)
+    #find_and_show_similar_scenes(num_pairs=3, min_overlap=0.4, max_overlap=0.45)
+    #show_dataset_statistics()
+    # Without downloaded data (point cache_dir at an empty folder; 1 archive
+    # = ~1,000 scenes, for a quick test):
+    #show_dataset_statistics(cache_dir=EMPTY_DATA_DIR, hub_scene_archives=1)
