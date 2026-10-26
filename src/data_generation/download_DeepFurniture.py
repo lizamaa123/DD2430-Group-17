@@ -52,6 +52,13 @@ REMOTE_BLOCK_SIZE = 8 * 1024 * 1024
 # delete_duplicate_scenes.
 EXCLUDED_SCENES_PATH = os.path.join(os.path.dirname(__file__), "deepfurniture_excluded_scenes.txt")
 
+# Scratch folder (inside cache_dir) that archives are downloaded into before
+# extraction. It is deleted when an archive is done or the run fails, and
+# swept at the start of every bulk download in case the previous run was
+# killed outright (e.g. VS Code's stop button sends SIGKILL, so no cleanup
+# code gets a chance to run).
+TMP_DOWNLOAD_DIRNAME = ".tmp_download"
+
 # Which file extensions to keep when extracting each archive type; anything
 # else (e.g. a scene's depth map, which is a .png alongside the .jpg) is
 # skipped during extraction so it's never written to disk.
@@ -96,12 +103,33 @@ def _save_excluded_scenes(scene_ids):
             f.write(f"{scene_id}\n")
 
 
+def _remove_leftover_downloads(cache_dir):
+    """
+    Delete the scratch download folder (TMP_DOWNLOAD_DIRNAME) left behind
+    by an earlier run that was killed before it could clean up after
+    itself.
+
+    Args:
+        cache_dir: Local root directory data is stored under.
+
+    Returns:
+        None.
+    """
+    shutil.rmtree(os.path.join(cache_dir, TMP_DOWNLOAD_DIRNAME), ignore_errors=True)
+
+
 def _download_and_extract_archive(subfolder, archive_name, keep_extensions, cache_dir):
     """
     Download one archive from data/{subfolder}/ in the DeepFurniture repo,
     extract only the members whose extension is in keep_extensions, then
     delete the downloaded archive. Scenes in EXCLUDED_SCENES_PATH are not
     extracted.
+
+    The archive is downloaded into a scratch folder (TMP_DOWNLOAD_DIRNAME)
+    that is deleted afterwards whether or not the download/extraction
+    finished, so an interrupted run (Ctrl-C or an error) doesn't leave a
+    partial multi-GB archive behind. If the process is killed outright,
+    the folder is removed at the start of the next download instead.
 
     Args:
         subfolder: Dataset folder the archive lives in on the Hub
@@ -115,27 +143,29 @@ def _download_and_extract_archive(subfolder, archive_name, keep_extensions, cach
     Returns:
         None.
     """
-    archive_path = hf_hub_download(
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        filename=f"data/{subfolder}/{archive_name}",
-        local_dir=cache_dir,
-    )
-
-    extract_dir = os.path.dirname(archive_path)
+    tmp_dir = os.path.join(cache_dir, TMP_DOWNLOAD_DIRNAME)
+    extract_dir = os.path.join(cache_dir, "data", subfolder)
 
     # Scene archives hold one folder per scene: {scene_id}/image.jpg etc.
     excluded = _load_excluded_scenes() if subfolder == "scenes" else set()
 
-    with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.split("/")[0] in excluded:
-                continue
-            if member.isfile() and member.name.lower().endswith(keep_extensions):
-                tar.extract(member, path=extract_dir)
-
-    # The archive itself isn't needed once the wanted files are extracted.
-    os.remove(archive_path)
+    try:
+        archive_path = hf_hub_download(
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            filename=f"data/{subfolder}/{archive_name}",
+            local_dir=tmp_dir,
+        )
+        with tarfile.open(archive_path, "r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.split("/")[0] in excluded:
+                    continue
+                if member.isfile() and member.name.lower().endswith(keep_extensions):
+                    tar.extract(member, path=extract_dir)
+    finally:
+        # The archive (and any half-finished download of it) isn't needed
+        # once the wanted files are extracted - or once the run is aborted.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _deduplicate_instance_styles(instance):
@@ -289,6 +319,7 @@ def download_deepfurniture_subset(
         None.
     """
     os.makedirs(cache_dir, exist_ok=True)
+    _remove_leftover_downloads(cache_dir)
 
     for filename in METADATA_FILES:
         hf_hub_download(
@@ -310,111 +341,6 @@ def download_deepfurniture_subset(
         for i in range(num_scene_archives):
             archive_name = f"scenes_{i:04d}.tar.gz"
             _download_and_extract_archive("scenes", archive_name, KEEP_EXTENSIONS["scenes"], cache_dir)
-
-
-def _ensure_local_file(repo_relative_path, cache_dir):
-    """
-    Return the local path to a single file from the DeepFurniture repo,
-    using it in place if it's already on disk and only reaching out to
-    the Hub otherwise.
-
-    Args:
-        repo_relative_path: Path of the file inside the dataset repo,
-            e.g. "data/metadata/categories.json".
-        cache_dir: Local root directory data is stored under.
-
-    Returns:
-        Local filesystem path (str) to the file.
-    """
-    local_path = os.path.join(cache_dir, repo_relative_path)
-    if os.path.exists(local_path):
-        return local_path
-
-    return hf_hub_download(
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        filename=repo_relative_path,
-        local_dir=cache_dir,
-    )
-
-
-def _ensure_scene_files(scene_id, chunk_name, cache_dir):
-    """
-    Return local paths to one scene's image and annotation JSON, fetching
-    just that scene - not the whole chunk archive it belongs to - if it
-    isn't already on disk.
-
-    Args:
-        scene_id: The scene's ID, e.g. "DVD3HFDYEJI4OKYQBT3WKSY8".
-        chunk_name: Name of the archive the scene lives in on the Hub,
-            e.g. "scenes_0000" (from scene_index.json).
-        cache_dir: Local root directory data is stored under.
-
-    Returns:
-        An (image_path, annotation_path, was_downloaded) tuple.
-        was_downloaded is True if these files had to be fetched just now,
-        so the caller knows to clean them up again afterward rather than
-        leaving a single stray scene behind that was never asked for.
-    """
-    scene_dir = os.path.join(cache_dir, "data", "scenes", scene_id)
-    image_path = os.path.join(scene_dir, "image.jpg")
-    annotation_path = os.path.join(scene_dir, "annotation.json")
-
-    if os.path.exists(image_path) and os.path.exists(annotation_path):
-        return image_path, annotation_path, False
-
-    # Downloaded to the Hub's own cache (not cache_dir) since we only want
-    # to keep the one scene we extract from it, not the whole archive.
-    archive_path = hf_hub_download(
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        filename=f"data/scenes/{chunk_name}.tar.gz",
-    )
-    with tarfile.open(archive_path, "r:gz") as tar:
-        # Same extension filter as the bulk download, so e.g. the scene's
-        # depth map (.png) is never written to disk.
-        members = [
-            m for m in tar.getmembers()
-            if m.name.startswith(f"{scene_id}/")
-            and m.isfile()
-            and m.name.lower().endswith(KEEP_EXTENSIONS["scenes"])
-        ]
-        tar.extractall(path=os.path.join(cache_dir, "data", "scenes"), members=members)
-
-    return image_path, annotation_path, True
-
-
-def _ensure_furniture_image(furniture_id, chunk_name, cache_dir):
-    """
-    Return the local path to one furniture item's image, fetching just
-    that item - not the whole chunk archive it belongs to - if it isn't
-    already on disk.
-
-    Args:
-        furniture_id: The furniture item's ID, e.g. "2880315".
-        chunk_name: Name of the archive the item lives in on the Hub,
-            e.g. "furnitures_0012" (from furniture_index.json).
-        cache_dir: Local root directory data is stored under.
-
-    Returns:
-        An (image_path, was_downloaded) tuple. was_downloaded is True if
-        the file had to be fetched just now, so the caller knows whether
-        to clean it up again afterward.
-    """
-    image_path = os.path.join(cache_dir, "data", "furnitures", f"{furniture_id}.jpg")
-    if os.path.exists(image_path):
-        return image_path, False
-
-    archive_path = hf_hub_download(
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        filename=f"data/furnitures/{chunk_name}.tar.gz",
-    )
-    with tarfile.open(archive_path, "r:gz") as tar:
-        member = tar.getmember(f"{furniture_id}.jpg")
-        tar.extract(member, path=os.path.join(cache_dir, "data", "furnitures"))
-
-    return image_path, True
 
 
 def _read_metadata_json(filename, cache_dir):
@@ -607,64 +533,68 @@ def _show_panels(images, labels, title, max_cols=7):
     plt.show()
 
 
-def _remove_downloaded_metadata(cache_dir, repo_relative_paths):
+def _load_scene(scene_id, chunk_name, cache_dir):
     """
-    Delete metadata files that were fetched just now (plus the Hugging Face
-    bookkeeping next to them), then remove every folder under cache_dir that
-    ends up empty - including cache_dir itself. Files that were already
-    there are never passed in, so existing data is left alone.
+    Load one scene's annotation and room image: from disk if the scene is
+    downloaded, otherwise straight from its archive on the Hub into memory
+    (one streamed pass for both files), without saving anything.
 
     Args:
+        scene_id: The scene's ID, e.g. "DVD3HFDYEJI4OKYQBT3WKSY8".
+        chunk_name: Name of the archive the scene lives in on the Hub,
+            e.g. "scenes_0000" (from scene_index.json).
         cache_dir: Local root directory data is stored under.
-        repo_relative_paths: Repo-relative paths of the files to delete,
-            e.g. ["data/metadata/scene_index.json"].
 
     Returns:
-        None.
+        Tuple (annotation, image): the parsed annotation JSON and a loaded
+        PIL image.
     """
-    for rel_path in repo_relative_paths:
-        for path in (
-            os.path.join(cache_dir, rel_path),
-            os.path.join(cache_dir, ".cache", "huggingface", "download", rel_path + ".metadata"),
-            os.path.join(cache_dir, ".cache", "huggingface", "download", rel_path + ".lock"),
-        ):
-            if os.path.exists(path):
-                os.remove(path)
+    scene_dir = os.path.join(cache_dir, "data", "scenes", scene_id)
+    image_path = os.path.join(scene_dir, "image.jpg")
+    annotation_path = os.path.join(scene_dir, "annotation.json")
 
-    # Files that don't count as data: macOS Finder droppings, and the
-    # boilerplate huggingface_hub writes into .cache/huggingface/.
-    junk = {".DS_Store", ".gitignore", "CACHEDIR.TAG"}
-    for root, dirs, files in os.walk(cache_dir, topdown=False):
-        in_hf_cache = os.sep + ".cache" in root + os.sep or root.endswith(".cache")
-        for name in files:
-            if name == ".DS_Store" or (in_hf_cache and name in junk):
-                os.remove(os.path.join(root, name))
-        if not os.listdir(root):
-            os.rmdir(root)
+    if os.path.exists(image_path) and os.path.exists(annotation_path):
+        with open(annotation_path) as f:
+            annotation = json.load(f)
+        image = Image.open(image_path)
+    else:
+        print(f"Reading scene {scene_id} from {chunk_name} on the Hub...")
+        filenames = ("image.jpg", "annotation.json")
+
+        def wanted(name):
+            prefix, _, filename = name.partition("/")
+            return filename if prefix == scene_id and filename in filenames else None
+
+        members = _stream_archive_members("scenes", chunk_name, wanted, len(filenames))
+        annotation = json.loads(members["annotation.json"])
+        image = Image.open(io.BytesIO(members["image.jpg"]))
+
+    image.load()
+    return annotation, image
 
 
 def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
     """
     Sanity-check the downloaded/extracted data by displaying random scenes
     (room images) next to every furniture item annotated in that room,
-    with each image's category and style labels shown beneath it.
+    with each image's category and style labels shown above it.
 
-    Works whether or not the data is already downloaded: anything already
-    present under cache_dir is used as-is; anything missing is fetched
-    just for that one scene/item (and the metadata index files) and deleted
-    again once displayed, so running this against an empty cache_dir leaves
-    nothing behind, and running it against a fully downloaded cache_dir
-    never re-downloads anything.
+    Works whether or not the data is already downloaded: anything present
+    under cache_dir is used as-is; anything missing (metadata index files,
+    the scene, item images) is read straight from the Hub into memory.
+    Nothing is ever written to disk, so there is nothing to clean up - even
+    if the run is interrupted or killed - and running it against an empty
+    cache_dir never creates that folder.
 
     This is a visualization/debugging aid for checking that the data
     extraction is correct - it isn't part of the data pipeline itself.
 
     Args:
         num_scenes: How many random scenes to sample and display.
-        cache_dir: Local root directory to look for/download data in.
-            Defaults to data/deepfurniture/ at the repo root. Point this
-            at an empty directory to exercise the "nothing downloaded
-            yet" path instead of whatever is already cached there.
+        cache_dir: Local root directory to look for data in. Defaults to
+            data/deepfurniture/ at the repo root. Point this at an empty
+            directory to exercise the "nothing downloaded yet" path
+            instead of whatever is already cached there.
         seed: Optional random seed, for reproducible sampling.
 
     Returns:
@@ -672,87 +602,34 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
     """
     rng = random.Random(seed)
 
-    # Remember which index files had to be fetched, so they can be removed
-    # again at the end (they're ~6 MB, not worth keeping for a one-off check).
-    index_paths = ["data/metadata/scene_index.json", "data/metadata/furniture_index.json"]
-    fetched_index_paths = [p for p in index_paths if not os.path.exists(os.path.join(cache_dir, p))]
-
-    with open(_ensure_local_file("data/metadata/scene_index.json", cache_dir)) as f:
-        scene_index = json.load(f)["scenes"]
     excluded = _load_excluded_scenes()
-    scene_index = [scene for scene in scene_index if scene["scene_id"] not in excluded]
-    with open(_ensure_local_file("data/metadata/furniture_index.json", cache_dir)) as f:
-        furniture_index = json.load(f)["furnitures"]
-    furniture_chunk_by_id = {f["furniture_id"]: f["chunk_name"] for f in furniture_index}
+    scene_index = [
+        scene for scene in _read_metadata_json("scene_index.json", cache_dir)["scenes"]
+        if scene["scene_id"] not in excluded
+    ]
 
-    sampled_scenes = rng.sample(scene_index, k=min(num_scenes, len(scene_index)))
-
-    for scene_entry in sampled_scenes:
+    for scene_entry in rng.sample(scene_index, k=min(num_scenes, len(scene_index))):
         scene_id = scene_entry["scene_id"]
+        annotation, room_image = _load_scene(scene_id, scene_entry["chunk_name"], cache_dir)
+        annotation = clean_scene_annotation(annotation)
 
-        image_path, annotation_path, scene_was_downloaded = _ensure_scene_files(
-            scene_id, scene_entry["chunk_name"], cache_dir
-        )
-        with open(annotation_path) as f:
-            annotation = clean_scene_annotation(json.load(f))
-        room_image = Image.open(image_path)
-        room_image.load()
+        instances = annotation["instances"]
+        furniture_ids = sorted({str(instance["identityID"]) for instance in instances})
+        # Items not in the metadata index or without an image are left out
+        # of the returned dict, and skipped below rather than guessed.
+        _, furniture_images = _load_display_images([], furniture_ids, cache_dir)
 
-        item_images = []
-        item_labels = []
-        item_cleanup = []
-        for instance in annotation["instances"]:
+        images = [room_image]
+        labels = ["Room"]
+        for instance in instances:
             furniture_id = str(instance["identityID"])
-            chunk_name = furniture_chunk_by_id.get(furniture_id)
-            if chunk_name is None:
-                continue  # not in the metadata index; skip rather than guess
-
-            item_path, item_was_downloaded = _ensure_furniture_image(furniture_id, chunk_name, cache_dir)
-            item_image = Image.open(item_path)
-            item_image.load()
-
-            item_images.append(item_image)
+            if furniture_id not in furniture_images:
+                continue
+            images.append(furniture_images[furniture_id])
             styles = ", ".join(instance["styleNames"]) or "unknown style"
-            item_labels.append(f"{instance['categoryName']}\n({styles})")
-            item_cleanup.append((item_path, item_was_downloaded))
+            labels.append(f"{instance['categoryName']}\n({styles})")
 
-        images = [room_image] + item_images
-        labels = ["Room"] + item_labels
-
-        max_cols = 7
-        num_panels = len(images)
-        num_cols = min(max_cols, num_panels)
-        num_rows = -(-num_panels // num_cols)  # ceil division
-
-        fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows))
-        axes = [axes] if num_panels == 1 else axes.flatten()
-
-        for ax, image, label in zip(axes, images, labels):
-            ax.imshow(image)
-            ax.set_title(label)
-            ax.axis("off")
-
-        # Hide any unused panels left over in the last row, e.g. a 7-item
-        # room fills a 2x5 grid but only uses 8 of its 10 slots.
-        for ax in axes[num_panels:]:
-            ax.axis("off")
-
-        plt.tight_layout()
-        plt.show()
-
-        # Clean up anything that was only fetched for this check, so a
-        # visualization run against an empty cache_dir leaves it empty
-        # again afterward.
-        if scene_was_downloaded:
-            # Remove the whole scene folder, not just the two files we read,
-            # so nothing else extracted alongside them is left behind.
-            shutil.rmtree(os.path.dirname(image_path), ignore_errors=True)
-        for item_path, item_was_downloaded in item_cleanup:
-            if item_was_downloaded:
-                os.remove(item_path)
-
-    if fetched_index_paths:
-        _remove_downloaded_metadata(cache_dir, fetched_index_paths)
+        _show_panels(images, labels, title=f"Scene {scene_id}")
 
 
 def _compact_instances(annotation):
@@ -1630,7 +1507,7 @@ def show_dataset_statistics(
 
 
 if __name__ == "__main__":
-    visualize_random_scenes(cache_dir=EMPTY_DATA_DIR)
+    visualize_random_scenes(num_scenes=1, cache_dir=EMPTY_DATA_DIR)
     #find_and_show_duplicate_scenes(num_groups=3)
     #find_and_show_similar_scenes(num_pairs=3, min_overlap=0.4, max_overlap=0.45)
     #show_dataset_statistics()
