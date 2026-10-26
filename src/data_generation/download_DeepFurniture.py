@@ -573,7 +573,50 @@ def _load_scene(scene_id, chunk_name, cache_dir):
     return annotation, image
 
 
-def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
+def _stream_first_scenes(chunk_name, num_scenes, excluded):
+    """
+    Read the first num_scenes scenes (annotation + room image) of one scene
+    archive on the Hub into memory, without saving anything. Only the start
+    of the archive is transferred - roughly 2 MB per scene - instead of
+    reading up to an arbitrary scene's position in the ~2 GB archive.
+
+    Args:
+        chunk_name: Archive name without extension, e.g. "scenes_0003".
+        num_scenes: How many complete scenes to read before stopping.
+        excluded: Set of scene_ids to skip (see EXCLUDED_SCENES_PATH).
+
+    Returns:
+        Dict mapping scene_id to an (annotation, image) tuple: the parsed
+        annotation JSON and a loaded PIL image. Fewer than num_scenes
+        entries only if the archive runs out first.
+    """
+    filenames = ("image.jpg", "annotation.json")
+    partial, complete = {}, {}
+    path = f"datasets/{REPO_ID}/data/scenes/{chunk_name}.tar.gz"
+    with HfFileSystem().open(path, "rb", block_size=REMOTE_BLOCK_SIZE) as f:
+        with tarfile.open(fileobj=f, mode="r|gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                scene_id, _, filename = member.name.partition("/")
+                if scene_id in excluded or filename not in filenames:
+                    continue
+                files = partial.setdefault(scene_id, {})
+                files[filename] = tar.extractfile(member).read()
+                if len(files) == len(filenames):
+                    complete[scene_id] = partial.pop(scene_id)
+                    if len(complete) >= num_scenes:
+                        break
+
+    scenes = {}
+    for scene_id, files in complete.items():
+        image = Image.open(io.BytesIO(files["image.jpg"]))
+        image.load()
+        scenes[scene_id] = (json.loads(files["annotation.json"]), image)
+    return scenes
+
+
+def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None, sample_from_first_n=None):
     """
     Sanity-check the downloaded/extracted data by displaying random scenes
     (room images) next to every furniture item annotated in that room,
@@ -596,21 +639,44 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None):
             directory to exercise the "nothing downloaded yet" path
             instead of whatever is already cached there.
         seed: Optional random seed, for reproducible sampling.
+        sample_from_first_n: Speed-up for when the data isn't downloaded.
+            None (default) samples from all scenes, and a scene that isn't
+            on disk can take several minutes to fetch, since its ~2 GB
+            archive has to be read up to that scene's position. If set to
+            a number N, scenes are instead sampled from the first N scenes
+            of one randomly chosen archive, so only the start of that
+            archive is read (~2 MB per scene; e.g. 10 reads ~20 MB). The
+            sample is then less random: always early scenes, all from the
+            same archive. The scenes' item images still come from the
+            furniture archives (~35 MB each, often several per scene), so
+            expect seconds to a couple of minutes rather than instant.
+            Scenes are always read from the Hub in this mode; with the data
+            downloaded, leave it at None, which is already instant.
 
     Returns:
         None.
     """
     rng = random.Random(seed)
-
     excluded = _load_excluded_scenes()
-    scene_index = [
-        scene for scene in _read_metadata_json("scene_index.json", cache_dir)["scenes"]
-        if scene["scene_id"] not in excluded
-    ]
 
-    for scene_entry in rng.sample(scene_index, k=min(num_scenes, len(scene_index))):
-        scene_id = scene_entry["scene_id"]
-        annotation, room_image = _load_scene(scene_id, scene_entry["chunk_name"], cache_dir)
+    if sample_from_first_n is None:
+        scene_index = [
+            scene for scene in _read_metadata_json("scene_index.json", cache_dir)["scenes"]
+            if scene["scene_id"] not in excluded
+        ]
+        sampled = rng.sample(scene_index, k=min(num_scenes, len(scene_index)))
+        # A generator, so each scene is fetched only right before it's shown.
+        scenes = ((entry["scene_id"], *_load_scene(entry["scene_id"], entry["chunk_name"], cache_dir)) for entry in sampled)
+    else:
+        if sample_from_first_n < 1:
+            raise ValueError(f"sample_from_first_n must be at least 1, got {sample_from_first_n}")
+        chunk_name = rng.choice([f"scenes_{i:04d}" for i in range(NUM_SCENE_ARCHIVES)])
+        print(f"Reading the first {sample_from_first_n} scenes of {chunk_name} from the Hub...")
+        first_scenes = _stream_first_scenes(chunk_name, sample_from_first_n, excluded)
+        sampled_ids = rng.sample(sorted(first_scenes), k=min(num_scenes, len(first_scenes)))
+        scenes = ((scene_id, *first_scenes[scene_id]) for scene_id in sampled_ids)
+
+    for scene_id, annotation, room_image in scenes:
         annotation = clean_scene_annotation(annotation)
 
         instances = annotation["instances"]
@@ -1507,10 +1573,7 @@ def show_dataset_statistics(
 
 
 if __name__ == "__main__":
-    visualize_random_scenes(num_scenes=1, cache_dir=EMPTY_DATA_DIR)
+    visualize_random_scenes(num_scenes=3, sample_from_first_n=20)
     #find_and_show_duplicate_scenes(num_groups=3)
     #find_and_show_similar_scenes(num_pairs=3, min_overlap=0.4, max_overlap=0.45)
     #show_dataset_statistics()
-    # Without downloaded data (point cache_dir at an empty folder; 1 archive
-    # = ~1,000 scenes, for a quick test):
-    #show_dataset_statistics(cache_dir=EMPTY_DATA_DIR, hub_scene_archives=1)
