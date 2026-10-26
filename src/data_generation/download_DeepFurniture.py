@@ -859,8 +859,8 @@ def _view_similarity(instances_a, instances_b):
     The overlap of each pair of boxes is measured with IoU (intersection
     over union, see _box_iou) and averaged over the items.
 
-    DeepFurniture has no 3D positions, so this is the closest thing to the
-    "same layout" check used for InstructScene. Near 1 means (almost) the
+    DeepFurniture has no 3D positions, so this is the closest thing to a
+    "same layout" check. Near 1 means (almost) the
     same image, e.g. the same render with the camera nudged slightly; low
     values mean the room is photographed from a different angle or the
     items are arranged differently. Instances of the same item (e.g. two
@@ -930,8 +930,7 @@ def find_and_show_duplicate_scenes(
     those groups, and return how many there are. Nothing is deleted or
     changed (apart from writing the SCENE_ITEMS_CACHE file).
 
-    The DeepFurniture counterpart of find_and_show_duplicate_rooms in
-    download_InstructScene.py. Two scenes count as having the same items
+    Two scenes count as having the same items
     if they contain the same item IDs, with the same number of each.
     Scenes with fewer than min_items items are ignored, because small
     scenes (e.g. just one sofa) often match by coincidence.
@@ -1087,8 +1086,7 @@ def delete_duplicate_scenes(
     Remove duplicate scenes, keeping exactly one scene per group of scenes
     with the same items, and make sure the removed scenes never come back.
 
-    The DeepFurniture counterpart of delete_duplicate_rooms in
-    download_InstructScene.py. Duplicates are scenes with the same item IDs
+    Duplicates are scenes with the same item IDs
     (same number of each), as in find_and_show_duplicate_scenes, whatever
     their view: scenes that show the same items from another angle (low
     bounding-box IoU, intersection over union) are removed too, since they

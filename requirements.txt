@@ -4,3 +4,6 @@ pandas
 scikit-learn
 jupyter
 tqdm
+huggingface_hub
+pillow
+matplotlib
