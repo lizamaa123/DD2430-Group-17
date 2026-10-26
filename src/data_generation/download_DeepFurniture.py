@@ -578,7 +578,7 @@ def _stream_first_scenes(chunk_name, num_scenes, excluded):
     Read the first num_scenes scenes (annotation + room image) of one scene
     archive on the Hub into memory, without saving anything. Only the start
     of the archive is transferred - roughly 2 MB per scene - instead of
-    reading up to an arbitrary scene's position in the ~2 GB archive.
+    reading up to an arbitrary scene's position in the roughly 2 GB archive.
 
     Args:
         chunk_name: Archive name without extension, e.g. "scenes_0003".
@@ -641,14 +641,14 @@ def visualize_random_scenes(num_scenes=3, cache_dir=DATA_DIR, seed=None, sample_
         seed: Optional random seed, for reproducible sampling.
         sample_from_first_n: Speed-up for when the data isn't downloaded.
             None (default) samples from all scenes, and a scene that isn't
-            on disk can take several minutes to fetch, since its ~2 GB
+            on disk can take several minutes to fetch, since its 2 GB
             archive has to be read up to that scene's position. If set to
             a number N, scenes are instead sampled from the first N scenes
             of one randomly chosen archive, so only the start of that
-            archive is read (~2 MB per scene; e.g. 10 reads ~20 MB). The
+            archive is read (about 2 MB per scene; e.g. 10 reads about 20 MB). The
             sample is then less random: always early scenes, all from the
             same archive. The scenes' item images still come from the
-            furniture archives (~35 MB each, often several per scene), so
+            furniture archives (about 35 MB each, often several per scene), so
             expect seconds to a couple of minutes rather than instant.
             Scenes are always read from the Hub in this mode; with the data
             downloaded, leave it at None, which is already instant.
