@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 from src.models.transformer import FurnitureEmbeddingPredictor, calculate_running_average
 
 
-class TestTransformerLivePlot(unittest.TestCase):
+class TestTransformer(unittest.TestCase):
     def test_calculate_running_average(self):
         # Empty
         self.assertEqual(len(calculate_running_average([])), 0)
@@ -29,11 +29,8 @@ class TestTransformerLivePlot(unittest.TestCase):
         self.assertEqual(len(avg_long), 20)
         self.assertAlmostEqual(avg_long[-1], 2.0)
 
-    def test_fit_with_live_plot_disabled(self):
-        # Create a lightweight model on CPU for testing
+    def test_fit_infonce_loss(self):
         model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
-
-        # Create dummy batch
         batch_size = 4
         room_len = 5
         dummy_batch = {
@@ -42,9 +39,32 @@ class TestTransformerLivePlot(unittest.TestCase):
         }
         train_loader = [dummy_batch, dummy_batch]
 
-        losses = model.fit(train_loader, epochs=1, live_plot=False)
+        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="infonce", temperature=0.1)
         self.assertEqual(len(losses), 2)
         self.assertTrue(all(isinstance(l, float) for l in losses))
+
+    def test_fit_cosine_loss(self):
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
+        batch_size = 4
+        room_len = 5
+        dummy_batch = {
+            "x": torch.randn(batch_size, room_len, 16),
+            "valid_mask": torch.ones(batch_size, room_len, dtype=torch.bool),
+        }
+        train_loader = [dummy_batch]
+
+        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="cosine")
+        self.assertEqual(len(losses), 1)
+        self.assertTrue(all(isinstance(l, float) for l in losses))
+
+    def test_fit_invalid_loss_type(self):
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
+        dummy_batch = {
+            "x": torch.randn(2, 3, 16),
+            "valid_mask": torch.ones(2, 3, dtype=torch.bool),
+        }
+        with self.assertRaises(ValueError):
+            model.fit([dummy_batch], epochs=1, live_plot=False, loss_type="unsupported")
 
     @patch("matplotlib.pyplot.show")
     @patch("matplotlib.pyplot.pause")
@@ -59,7 +79,7 @@ class TestTransformerLivePlot(unittest.TestCase):
         }
         train_loader = [dummy_batch, dummy_batch, dummy_batch]
 
-        losses = model.fit(train_loader, epochs=1, live_plot=True, plot_every=1)
+        losses = model.fit(train_loader, epochs=1, live_plot=True, plot_every=1, loss_type="infonce")
         self.assertEqual(len(losses), 3)
         self.assertTrue(mock_pause.called)
         self.assertTrue(mock_show.called)

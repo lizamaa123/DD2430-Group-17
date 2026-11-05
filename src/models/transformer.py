@@ -91,8 +91,10 @@ class FurnitureEmbeddingPredictor(nn.Module):
         lr=2e-5,
         live_plot=True,
         plot_every=1,
+        loss_type="infonce",
+        temperature=0.07,
     ):
-        """Trains the transformer on positive pairs ONLY (currently) with cosine similarity and AdamW optimiser.
+        """Trains the transformer using in-batch contrastive / InfoNCE loss or pairwise cosine similarity.
 
         Args:
             train_loader: DataLoader yielding batches of dicts with 'x' and 'valid_mask'.
@@ -102,16 +104,20 @@ class FurnitureEmbeddingPredictor(nn.Module):
             lr (float): Learning rate for AdamW optimizer.
             live_plot (bool): If True, displays a live updating matplotlib chart of batch loss during training.
             plot_every (int): Frequency (in batches) at which the live chart updates.
+            loss_type (str): Loss function to use: 'infonce' (in-batch contrastive, default) or 'cosine'.
+            temperature (float): Temperature parameter for InfoNCE scaling (default: 0.07).
         """
 
-        print(f"Training with device: {self.device}")
+        print(f"Training with device: {self.device} (loss: {loss_type}, temperature: {temperature})")
         self.to(self.device)
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr)
-        cos_loss = torch.nn.CosineEmbeddingLoss()
+        cos_loss = torch.nn.CosineEmbeddingLoss() if loss_type == "cosine" else None
 
         # logging
         train_batch_losses = []
+
+        loss_label = "InfoNCE Loss" if loss_type == "infonce" else "Cosine Loss"
 
         # Setup live plotting if requested
         is_notebook = False
@@ -143,9 +149,9 @@ class FurnitureEmbeddingPredictor(nn.Module):
             (smooth_line,) = ax.plot(
                 [], [], label="Running Avg (50 batches)", color="crimson", linewidth=1.8
             )
-            ax.set_title("Training Loss (Batch)")
+            ax.set_title(f"Training Loss ({loss_label})")
             ax.set_xlabel("Batch")
-            ax.set_ylabel("Cosine Loss")
+            ax.set_ylabel(loss_label)
             ax.grid(True, linestyle="--", alpha=0.6)
             ax.legend(loc="upper right")
             fig.tight_layout()
@@ -176,7 +182,7 @@ class FurnitureEmbeddingPredictor(nn.Module):
             ax.relim()
             ax.autoscale_view()
             ax.set_title(
-                f"Batch Training Loss - Epoch {epoch_idx + 1}/{epochs} | "
+                f"Batch Training Loss ({loss_label}) - Epoch {epoch_idx + 1}/{epochs} | "
                 f"Batch {n_batches} | Loss: {current_loss:.4f}"
             )
 
@@ -219,20 +225,30 @@ class FurnitureEmbeddingPredictor(nn.Module):
                     # Save the true furniture embedding before masking.
                     true = x[batch_indices, mask_idx,:]
 
-                    # 1 = positive pair:
-                    # prediction should be similar to the true embedding.
-                    pair_flags = torch.ones(batch_size, device=self.device)
-
                     optimizer.zero_grad()
 
                     # Transformer replaces the chosen real item with MASK.
                     # valid_mask tells the Transformer which positions are PAD.
                     pred = self.forward(x,valid_mask,mask_idx)
-                    loss = cos_loss(
-                        pred,
-                        true,
-                        pair_flags
-                    )
+
+                    if loss_type == "infonce":
+                        # In-batch contrastive / InfoNCE loss
+                        true_norm = F.normalize(true, p=2, dim=-1)
+                        # Cosine similarity matrix between predictions and in-batch targets
+                        sim_matrix = torch.matmul(pred, true_norm.T) / temperature
+                        targets = torch.arange(batch_size, device=self.device)
+                        loss = F.cross_entropy(sim_matrix, targets)
+                    
+                    elif loss_type == "cosine":
+                        pair_flags = torch.ones(batch_size, device=self.device)
+                        loss = cos_loss(
+                            pred,
+                            true,
+                            pair_flags
+                        )
+                    else:
+                        raise ValueError(f"Unknown loss_type: {loss_type}. Choose 'infonce' or 'cosine'.")
+
                     loss.backward()
                     optimizer.step()
                     batch_loss_val = loss.item()
