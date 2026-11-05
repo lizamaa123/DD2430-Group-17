@@ -1,12 +1,42 @@
 import json
 import torch
 from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
 
+from src.data_generation.item_encoder import load_item_catalog
 
-ROOMS_PATH = "data/synthetic_rooms.json"
-EMBEDDINGS_PATH = "data/item_embeddings.pt"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+ROOMS_PATH = PROJECT_ROOT / "data" / "synthetic_rooms.json"
+EMBEDDINGS_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
 EMBED_DIM = 384
+
+
+def load_rooms_as_descriptions(split="test"):
+    """Load generated rooms as lists of canonical catalog descriptions."""
+    with open(ROOMS_PATH, "r") as f:
+        rooms = json.load(f)
+
+    item_ids, descriptions = load_item_catalog()
+    descriptions_by_id = dict(zip(item_ids, descriptions))
+    selected_rooms = [room for room in rooms if room["split"] == split]
+
+    missing_ids = {
+        item_id
+        for room in selected_rooms
+        for item_id in room["item_ids"]
+        if item_id not in descriptions_by_id
+    }
+    if missing_ids:
+        raise KeyError(
+            f"Generated rooms contain {len(missing_ids)} IDs absent from the catalog; "
+            f"first missing ID: {next(iter(missing_ids))}"
+        )
+
+    return [
+        [descriptions_by_id[item_id] for item_id in room["item_ids"]]
+        for room in selected_rooms
+    ]
 
 
 class RoomDataset(Dataset):

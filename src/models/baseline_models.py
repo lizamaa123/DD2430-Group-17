@@ -41,15 +41,22 @@ class PopularityPrior():
         return predicitions
     
 class ItemContentBaseline:
-    def __init__(self, item_id, item_descriptions):
-        # model needs access to data through item ids
+    def __init__(self, item_id, item_descriptions, return_descriptions=False):
+        # Keep IDs and descriptions aligned with the embedding rows.
         self.item_id = np.array(item_id)
+        self.item_descriptions = list(item_descriptions)
+        self.return_descriptions = return_descriptions
+        self._id_to_row = {item: row for row, item in enumerate(self.item_id)}
+        self._description_to_row = {
+            description: row
+            for row, description in enumerate(self.item_descriptions)
+        }
         
         # loading pre-trained SBERT
         self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
         
         # create embeddings of item descriptions
-        self.item_embedding = self.model.encode(item_descriptions)
+        self.item_embedding = self.model.encode(self.item_descriptions)
 
     def fit(self, training_rooms):
         # this baseline model doesn't need to learn from room groupings
@@ -57,15 +64,22 @@ class ItemContentBaseline:
         pass
 
     def predict(self, partial_room, k=10):
-        # find embeddings for the items currently in the room
+        lookup = (
+            self._description_to_row
+            if self.return_descriptions
+            else self._id_to_row
+        )
+
         present_item_rows = []
         for item in partial_room:
-            if item in self.item_id:
-                row_number = list(self.item_id).index(item)
+            if item in lookup:
+                row_number = lookup[item]
                 present_item_rows.append(row_number)
         
         if not present_item_rows:
             # if we do not have valid items we just return the first k catalog items
+            if self.return_descriptions:
+                return self.item_descriptions[:k]
             return self.item_id[:k].tolist()
             
         present_item_embedding = self.item_embedding[present_item_rows]
@@ -82,9 +96,14 @@ class ItemContentBaseline:
         
         # pick the top k items that are not already in the room = predicitons 
         predictions = []
-        for ids in sorted_indices:
-            item = str(self.item_id[ids])
-            if item not in partial_room:
+        present_items = set(partial_room)
+        for row in sorted_indices:
+            item = (
+                self.item_descriptions[row]
+                if self.return_descriptions
+                else self.item_id[row]
+            )
+            if item not in present_items:
                 predictions.append(item)
             if len(predictions) == k:
                 break

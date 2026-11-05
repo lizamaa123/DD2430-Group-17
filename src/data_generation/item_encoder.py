@@ -1,10 +1,13 @@
+from pathlib import Path
+
 import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer
 
 
-DATA_PATH = "data/processed_ikea_data.csv"
-OUTPUT_PATH = "data/item_embeddings.pt"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = PROJECT_ROOT / "data" / "processed_ikea_data.csv"
+OUTPUT_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 
@@ -30,6 +33,27 @@ def build_item_text(row):
         f"Description: {description}. "
         f"Designer: {designer}."
     )
+
+
+def load_item_catalog(data_path=DATA_PATH):
+    """Return catalog IDs and descriptions in the same order."""
+    df = pd.read_csv(data_path)
+    df["item_id"] = df["item_id"].astype(int)
+    item_ids = df["item_id"].tolist()
+    descriptions = df.apply(build_item_text, axis=1).tolist()
+    return item_ids, descriptions
+
+
+def load_aligned_embeddings(item_ids, embeddings_path=OUTPUT_PATH):
+    """Load saved embeddings as a matrix aligned with ``item_ids``."""
+    saved_embeddings = torch.load(embeddings_path, weights_only=False)
+    missing_ids = [item_id for item_id in item_ids if item_id not in saved_embeddings]
+    if missing_ids:
+        raise KeyError(
+            f"Embeddings are missing for {len(missing_ids)} catalog items; "
+            f"first missing ID: {missing_ids[0]}"
+        )
+    return torch.stack([saved_embeddings[item_id] for item_id in item_ids])
 
 
 def create_embeddings():
