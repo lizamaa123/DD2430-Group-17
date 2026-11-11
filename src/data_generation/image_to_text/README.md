@@ -31,15 +31,16 @@ item's text, and embedded with the same encoder.
 
 ## The files
 
-**The three files you run**, in this order:
+**The files you run**, in this order:
 
 | File | What it's for |
 |---|---|
 | `run_captioning.py` | **The main script.** Goes through the items, asks the model, checks the answers and saves them. |
 | `build_texts.py` | Turns the saved answers into IKEA-style texts and embeds them. |
 | `quality_checks.py` | Prints a report on how good the answers are, and can write a spreadsheet for checking answers by hand. |
+| `show_captions.py` | Shows the item pictures with the model's answer underneath, to check by eye that the descriptions are right. |
 
-**The helper files** (used by the three above, not run on their own):
+**The helper files** (used by the ones above, not run on their own):
 
 | File | What it's for |
 |---|---|
@@ -100,9 +101,9 @@ would make the two datasets look more different than they are.
 
 ## How to run it
 
-There are three files you run: `run_captioning.py`, `build_texts.py` and `quality_checks.py`.
-Each has a **SETTINGS** block at the top. Change the settings, then run the file (e.g. with
-the Run button in VS Code). The other files are only used by these three.
+There are four files you run: `run_captioning.py`, `build_texts.py`, `quality_checks.py` and
+`show_captions.py`. Each has a **SETTINGS** block at the top. Change the settings, then run
+the file (e.g. with the Run button in VS Code). The other files are only used by these four.
 
 Extra packages needed: `transformers` and `accelerate` (to run the model directly), `openai`
 (to talk to a model server), `sentence-transformers` (for the embeddings).
@@ -125,7 +126,7 @@ short description.
 Tip: set `LIMIT = 5` the first time, to see that the model works before running all 154.
 
 At the end, the script prints the name of the file the answers were saved to, e.g.
-`pilot_Qwen3.5-4B_full_v1.jsonl`. The other two scripts need this name.
+`pilot_Qwen3.5-4B_full_v2.jsonl`. The other two scripts need this name.
 
 ### 3. Look at the pilot results
 
@@ -133,6 +134,11 @@ In `quality_checks.py`, set `CAPTIONS_FILE` to the full-prompt file and `COMPARE
 short-prompt file, then run it. It prints a report and writes a spreadsheet
 (`..._grading.csv`) with every answer, so you can mark right and wrong while looking at the
 images.
+
+To look at the answers next to the pictures, set `CAPTIONS_FILE` in `show_captions.py` and
+run it. It shows 6 items per window; close the window to see the next ones. Answers in red
+need a closer look (unusable, uncertain or flagged by the checks). With `ONLY = "problems"`
+or `CATEGORY = "lamp"` you can show just those items.
 
 ### 4. Make the texts and embeddings
 

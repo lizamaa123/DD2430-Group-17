@@ -38,7 +38,8 @@ CAPTIONS_DIR = os.path.join(OUTPUT_DIR, "captions")
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 # Increase when the prompt, schema, examples or category mapping change.
-PROMPT_VERSION = "v1"
+# v2: stronger "describe only the item, not the background" instruction.
+PROMPT_VERSION = "v2"
 
 MAX_NEW_TOKENS = 300
 

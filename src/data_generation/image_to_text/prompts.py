@@ -115,8 +115,9 @@ def build_prompt(df_category, variant="full"):
     examples = "; ".join(f'"{p}"' for p in example_phrases(df_category))
 
     lines = [
-        "The image is a product render of a single item of furniture or home decor "
-        "on a plain background.",
+        "The image shows a single item of furniture or home decor. Describe only the item "
+        "itself: the plain grey wall, floor and lighting are the same in every image and are "
+        "not part of the item.",
         f"The dataset labels it as: {shown_category}.",
         "",
         "Describe it as a JSON object with exactly these fields, in this order:",
@@ -139,8 +140,7 @@ def build_prompt(df_category, variant="full"):
             '- "material": the visible material or materials (at most 6 words).',
             '- "details": up to 3 distinguishing design details, comma-separated.',
             f'- "style": a list of 1-{config.MAX_STYLES} styles that fit the item, chosen from: {styles}.',
-            '- "caption": one sentence describing the item (at most 25 words). '
-            "Do not mention the background or that it is a render.",
+            '- "caption": one sentence describing the item (at most 25 words).',
             '- "uncertain": true if you cannot identify the item confidently, the image shows '
             "several separate items, the item is cut off, or it does not look like a "
             f"{shown_category}; otherwise false.",
@@ -148,7 +148,8 @@ def build_prompt(df_category, variant="full"):
 
     lines += [
         "",
-        "Never mention sizes, measurements, brands or product names. "
-        "Answer with the JSON object only.",
+        "In every field: never mention the background, wall, floor, the scene's lighting or shadows, or "
+        "that the image is a render or photo; never mention sizes, measurements, brands, logos "
+        "or product names. Answer with the JSON object only.",
     ]
     return "\n".join(lines)

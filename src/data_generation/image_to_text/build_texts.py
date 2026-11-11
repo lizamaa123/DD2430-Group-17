@@ -46,7 +46,7 @@ TEXT_VARIANTS = ("short", "medium", "rich", "caption")
 # ===========================================================================
 
 # The file name printed at the end of run_captioning.py.
-CAPTIONS_FILE = "pilot_Qwen3.5-4B_full_v1.jsonl"
+CAPTIONS_FILE = "pilot_Qwen3.5-4B_full_v2.jsonl"
 
 # Which text versions to build (see the top of this file).
 VARIANTS = ["short", "medium", "rich", "caption"]

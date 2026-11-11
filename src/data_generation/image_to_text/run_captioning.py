@@ -47,14 +47,14 @@ PROMPT_VARIANT = "full"
 # "dry-run": no model, placeholder answers - for checking that the code works.
 # "transformers": load the model in this process (GPU, Mac or CPU).
 # "server": send the images to a running vLLM / LM Studio server.
-BACKEND = "dry-run"
+BACKEND = "transformers"
 
-MODEL = config.DEFAULT_MODEL  # e.g. "Qwen/Qwen3.5-0.8B" for a quick test on a Mac
+MODEL = "Qwen/Qwen3.5-0.8B" # e.g. "Qwen/Qwen3.5-0.8B" for a quick test on a Mac, config.DEFAULT_MODEL to use the default
 
 PILOT_ITEMS_PER_CATEGORY = 14  # 11 categories -> 154 items
 PILOT_SEED = 42  # same seed = same pilot items, so runs can be compared
 
-LIMIT = None  # e.g. 5 to only do the first 5 items while testing
+LIMIT = 11 # e.g. 5 to only do the first 5 items while testing, None to have no limit
 BATCH_SIZE = 4  # items sent to the model at once
 RETRY_INVALID = False  # True: redo items whose saved answer was unusable
 

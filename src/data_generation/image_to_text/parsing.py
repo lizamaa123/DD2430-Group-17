@@ -29,6 +29,40 @@ _COLOUR_MATERIAL_WORDS = {
 
 _STYLE_NAME_BY_DISPLAY = {display.lower(): name for name, display in config.STYLE_DISPLAY.items()}
 
+# Every render has the same grey wall and floor behind the item, so phrases
+# about it describe the photo setup, not the item. Phrases like "on a gray
+# background" / "against a plain white backdrop" are removed automatically.
+_BACKGROUND_PHRASE = re.compile(
+    r",?\s*\b(?:on|against|in front of|set against|placed on|standing on|with)\s+"
+    r"(?:a|an|the)\s+(?:[a-z-]+\s+){0,3}(?:background|backdrop)\b",
+    re.IGNORECASE,
+)
+# Mentions that are probably about the setup but can't be removed safely
+# (e.g. "on a plain wall" could also describe a wall lamp's mounting). These
+# are only flagged, so they show up in show_captions.py and quality_checks.py.
+_BACKGROUND_MENTION = re.compile(
+    r"\b(?:background|backdrop|render(?:ed|ing)?|studio|shadows?|"
+    r"(?:plain|grey|gray|blank|white|neutral)\s+(?:wall|floor|surface))\b",
+    re.IGNORECASE,
+)
+
+
+def remove_background_mentions(text):
+    """
+    Remove phrases about the image background from one text field.
+
+    Args:
+        text: A cleaned string field.
+
+    Returns:
+        (text, removed, still_mentions): the text without background
+        phrases, whether anything was removed, and whether it still seems
+        to mention the setup (to be flagged for review).
+    """
+    cleaned = _BACKGROUND_PHRASE.sub("", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(",").strip()
+    return cleaned, cleaned != text, bool(_BACKGROUND_MENTION.search(cleaned))
+
 
 def extract_json(raw):
     """
@@ -125,7 +159,12 @@ def parse_answer(raw, df_category, variant="full"):
         if value is None:
             problems.append(f"missing {name}")
             value = ""
-        fields[name] = _clean_text(value)
+        text, removed, still_mentions = remove_background_mentions(_clean_text(value))
+        if removed:
+            problems.append(f"background removed from {name}")
+        if still_mentions:
+            problems.append(f"{name} mentions background")
+        fields[name] = text
     # Captions are sentences; keep their full stop.
     if fields["caption"]:
         fields["caption"] += "."

@@ -80,17 +80,26 @@ def sample_pilot_items(items, per_category=14, seed=42):
         seed: Random seed.
 
     Returns:
-        List of item dicts, grouped by category.
+        List of item dicts, taking turns between the categories (bed,
+        cabinet, chair, ..., bed, cabinet, ...). That way the first few
+        items already cover every category, which matters when testing
+        with LIMIT.
     """
     by_category = defaultdict(list)
     for item in items:
         by_category[item["df_category"]].append(item)
 
     rng = random.Random(seed)
+    per_category_samples = [
+        rng.sample(by_category[category], min(per_category, len(by_category[category])))
+        for category in sorted(by_category)
+    ]
+
     sample = []
-    for category in sorted(by_category):
-        pool = by_category[category]
-        sample.extend(rng.sample(pool, min(per_category, len(pool))))
+    for i in range(per_category):
+        for category_sample in per_category_samples:
+            if i < len(category_sample):
+                sample.append(category_sample[i])
     return sample
 
 
