@@ -41,7 +41,7 @@ MODE = "pilot"
 
 # "full": ask for every field. "short": only category and type (used once in
 # the pilot, to check that the many fields don't change the short answer).
-PROMPT_VARIANT = "full"
+PROMPT_VARIANT = "short"
 
 # How the model is run (see backends.py):
 # "dry-run": no model, placeholder answers - for checking that the code works.
@@ -49,12 +49,12 @@ PROMPT_VARIANT = "full"
 # "server": send the images to a running vLLM / LM Studio server.
 BACKEND = "transformers"
 
-MODEL = "Qwen/Qwen3.5-0.8B" # e.g. "Qwen/Qwen3.5-0.8B" for a quick test on a Mac, config.DEFAULT_MODEL to use the default
+MODEL = "Qwen/Qwen3.5-2B" # e.g. "Qwen/Qwen3.5-0.8B" for a quick test on a Mac, config.DEFAULT_MODEL to use the default
 
 PILOT_ITEMS_PER_CATEGORY = 14  # 11 categories -> 154 items
 PILOT_SEED = 42  # same seed = same pilot items, so runs can be compared
 
-LIMIT = 11 # e.g. 5 to only do the first 5 items while testing, None to have no limit
+LIMIT = 22 # e.g. 5 to only do the first 5 items while testing, None to have no limit
 BATCH_SIZE = 4  # items sent to the model at once
 RETRY_INVALID = False  # True: redo items whose saved answer was unusable
 
@@ -68,7 +68,7 @@ SERVER_WORKERS = 8  # requests in flight at once; keep BATCH_SIZE at least this 
 SERVER_ENFORCE_SCHEMA = True  # set to False if the server rejects the answer format
 
 # None: name the file after the settings, e.g. pilot_Qwen3.5-4B_full_v1.jsonl
-OUTPUT_FILE = None
+OUTPUT_FILE = "speed_" + MODEL.split("/")[-1] + ".jsonl"
 
 # ===========================================================================
 

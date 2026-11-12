@@ -45,11 +45,11 @@ from src.data_generation.image_to_text.dataset import (  # noqa: E402
 # ===========================================================================
 
 # The file name printed at the end of run_captioning.py.
-CAPTIONS_FILE = "pilot_Qwen3.5-0.8B_full_v1.jsonl"
+CAPTIONS_FILE = "pilot_Qwen3.5-0.8B_full_v2.jsonl"
 
 # A second run on the same items to compare with (e.g. the short prompt),
 # or None.
-COMPARE_FILE = "pilot_Qwen3.5-4B_short_v1.jsonl"
+COMPARE_FILE = "pilot_Qwen3.5-0.8B_short_v2.jsonl"
 
 # Write <captions file>_grading.csv: every answer with empty columns to
 # mark right/wrong by hand while looking at the images.
