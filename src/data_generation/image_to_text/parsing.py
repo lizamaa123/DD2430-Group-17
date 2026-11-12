@@ -7,6 +7,11 @@ a category that isn't allowed, which is caught here. Small deviations
 (e.g. "Chests of drawers" instead of "Chests of drawers & drawer units")
 are snapped to the closest allowed value and noted as a problem, so they
 can be counted in the pilot.
+
+Apart from that, nothing in the answer is changed or removed: possible
+mistakes (sizes in "type", mentions of the background, ...) are only
+flagged, so they can be looked at in show_captions.py / quality_checks.py
+before deciding whether to remove them automatically.
 """
 
 import difflib
@@ -29,17 +34,11 @@ _COLOUR_MATERIAL_WORDS = {
 
 _STYLE_NAME_BY_DISPLAY = {display.lower(): name for name, display in config.STYLE_DISPLAY.items()}
 
-# Every render has the same grey wall and floor behind the item, so phrases
-# about it describe the photo setup, not the item. Phrases like "on a gray
-# background" / "against a plain white backdrop" are removed automatically.
-_BACKGROUND_PHRASE = re.compile(
-    r",?\s*\b(?:on|against|in front of|set against|placed on|standing on|with)\s+"
-    r"(?:a|an|the)\s+(?:[a-z-]+\s+){0,3}(?:background|backdrop)\b",
-    re.IGNORECASE,
-)
-# Mentions that are probably about the setup but can't be removed safely
-# (e.g. "on a plain wall" could also describe a wall lamp's mounting). These
-# are only flagged, so they show up in show_captions.py and quality_checks.py.
+# Every render has the same grey wall and floor behind the item, so words
+# about it probably describe the photo setup, not the item ("on a gray
+# background", "on a plain wall"). They are only flagged, not removed: a
+# decoration's picture can have a background of its own, and a wall lamp is
+# mounted on a wall.
 _BACKGROUND_MENTION = re.compile(
     r"\b(?:background|backdrop|render(?:ed|ing)?|studio|shadows?|"
     r"(?:plain|grey|gray|blank|white|neutral)\s+(?:wall|floor|surface))\b",
@@ -47,21 +46,9 @@ _BACKGROUND_MENTION = re.compile(
 )
 
 
-def remove_background_mentions(text):
-    """
-    Remove phrases about the image background from one text field.
-
-    Args:
-        text: A cleaned string field.
-
-    Returns:
-        (text, removed, still_mentions): the text without background
-        phrases, whether anything was removed, and whether it still seems
-        to mention the setup (to be flagged for review).
-    """
-    cleaned = _BACKGROUND_PHRASE.sub("", text)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(",").strip()
-    return cleaned, cleaned != text, bool(_BACKGROUND_MENTION.search(cleaned))
+def mentions_background(text):
+    """True if the text seems to talk about the image setup rather than the item."""
+    return bool(_BACKGROUND_MENTION.search(text))
 
 
 def extract_json(raw):
@@ -140,12 +127,12 @@ def parse_answer(raw, df_category, variant="full"):
     else:
         fields["ikea_category"] = config.DF_FIXED_CATEGORY[df_category]
 
-    # Type: required, without sizes, sentence case.
-    item_type = strip_measurements(_clean_text(data.get("type", "")))
+    # Type: required, sentence case. Sizes are flagged, not removed.
+    item_type = _clean_text(data.get("type", ""))
     if not item_type:
         return {}, ["empty type"], False
-    if item_type != _clean_text(data.get("type", "")):
-        problems.append("type had measurements")
+    if strip_measurements(item_type) != item_type:
+        problems.append("type has measurements")
     item_type = item_type[0].upper() + item_type[1:]
     if set(re.findall(r"[a-z]+", item_type.lower())) & _COLOUR_MATERIAL_WORDS:
         problems.append("type mentions colour/material")
@@ -159,10 +146,8 @@ def parse_answer(raw, df_category, variant="full"):
         if value is None:
             problems.append(f"missing {name}")
             value = ""
-        text, removed, still_mentions = remove_background_mentions(_clean_text(value))
-        if removed:
-            problems.append(f"background removed from {name}")
-        if still_mentions:
+        text = _clean_text(value)
+        if mentions_background(text):
             problems.append(f"{name} mentions background")
         fields[name] = text
     # Captions are sentences; keep their full stop.
