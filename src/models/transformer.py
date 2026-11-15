@@ -23,11 +23,20 @@ def calculate_running_average(losses, window_size=50):
 
 class FurnitureEmbeddingPredictor(nn.Module):
 
-    def __init__(self, embed_dim=384, hid_dim = 256, nhead=4, num_layers=3, device = None):
+    def __init__(
+        self,
+        embed_dim=384,
+        hid_dim=256,
+        nhead=4,
+        num_layers=3,
+        num_candidates=3,
+        device=None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.num_candidates = num_candidates
         self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-        print(f"Loaded instance on device: {self.device}")
+        print(f"Loaded instance on device: {self.device} with {self.num_candidates} candidate head(s)")
         self.to(self.device)
 
         # Trainable representation for the masked slot
@@ -44,21 +53,36 @@ class FurnitureEmbeddingPredictor(nn.Module):
             encoder_layer, num_layers=num_layers
         )
 
-        # Projection head, outputting logits
+        # Multi-candidate projection head
         self.proj_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim, device=self.device),
+            nn.Linear(embed_dim, hid_dim, device=self.device),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim, device=self.device),
+            nn.Linear(hid_dim, num_candidates * embed_dim, device=self.device),
         )
 
-    def forward(self, x, valid_mask, mask_index):
+        # Certainty / confidence head
+        self.conf_head = nn.Sequential(
+            nn.Linear(embed_dim, max(hid_dim // 2, num_candidates), device=self.device),
+            nn.ReLU(),
+            nn.Linear(max(hid_dim // 2, num_candidates), num_candidates, device=self.device),
+        )
+
+    def forward(self, x, valid_mask, mask_index, return_confidence=False):
         """Does inference for a batch of room sets with already embedded furniture/label vectors.
         
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
-            mask_index (int): The index of the furniture item to be masked in each sample.
+            valid_mask (torch.Tensor): Bool tensor of shape (batch_size, seq_len), True for real items.
+            mask_index (int or torch.Tensor): The index of the furniture item to be masked in each sample.
+            return_confidence (bool): If True, returns (preds, conf_logits).
+
         Returns:
-            torch.Tensor: Predicted vector of shape (embed_dim) for the masked furniture item, normalized to unit length."""
+            torch.Tensor or tuple:
+                - If return_confidence is True: (preds, conf_logits) with preds shape (B, M, D)
+                  and conf_logits shape (B, M).
+                - If return_confidence is False and num_candidates == 1: preds shape (B, D).
+                - If return_confidence is False and num_candidates > 1: preds shape (B, M, D).
+        """
 
         # x shape: (batch_size, seq_len, embed_dim)
         # Replace the target index in each sample with the learnable mask token
@@ -77,15 +101,27 @@ class FurnitureEmbeddingPredictor(nn.Module):
         out = self.transformer(x, src_key_padding_mask=padding_mask)
 
         # Extract the hidden vector at the masked index
-        predicted_vec = self.proj_head(out[batch_indices, mask_index, :])
+        hidden = out[batch_indices, mask_index, :]
 
-        # Normalize to unit sphere (essential for cosine similarity matching)
-        return F.normalize(predicted_vec, p=2, dim=-1)
+        raw_preds = self.proj_head(hidden)
+        preds = raw_preds.view(batch_size, self.num_candidates, self.embed_dim)
+        preds = F.normalize(preds, p=2, dim=-1)
+
+        conf_logits = self.conf_head(hidden)
+
+        if return_confidence:
+            return preds, conf_logits
+
+        if self.num_candidates == 1:
+            return preds.squeeze(1)
+
+        return preds
     
     def fit(
         self,
         train_loader,
         val_loader=None,
+        labeled_data: bool = True,
         epochs=20,
         debug_prints=False,
         lr=2e-5,
@@ -93,12 +129,15 @@ class FurnitureEmbeddingPredictor(nn.Module):
         plot_every=1,
         loss_type="infonce",
         temperature=0.07,
+        conf_weight=0.2,
     ):
-        """Trains the transformer using in-batch contrastive / InfoNCE loss or pairwise cosine similarity.
+        """Trains the transformer using in-batch contrastive / InfoNCE loss or pairwise cosine similarity,
+        with Winner-Take-All multi-head training and confidence prediction.
 
         Args:
             train_loader: DataLoader yielding batches of dicts with 'x' and 'valid_mask'.
             val_loader: Optional validation DataLoader.
+            train_with_labels: Decides whether to insert the room label as the first item in the rooms for training transformer.
             epochs (int): Number of training epochs.
             debug_prints (bool): If True, prints batch-level losses.
             lr (float): Learning rate for AdamW optimizer.
@@ -106,9 +145,10 @@ class FurnitureEmbeddingPredictor(nn.Module):
             plot_every (int): Frequency (in batches) at which the live chart updates.
             loss_type (str): Loss function to use: 'infonce' (in-batch contrastive, default) or 'cosine'.
             temperature (float): Temperature parameter for InfoNCE scaling (default: 0.07).
+            conf_weight (float): Weight multiplier for the confidence head cross-entropy loss (default: 0.2).
         """
 
-        print(f"Training with device: {self.device} (loss: {loss_type}, temperature: {temperature})")
+        print(f"Training with device: {self.device} (loss: {loss_type}, temp: {temperature}, heads: {self.num_candidates})")
         self.to(self.device)
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr)
@@ -212,6 +252,7 @@ class FurnitureEmbeddingPredictor(nn.Module):
 
                     # True = real furniture, False = PAD
                     valid_mask = batch["valid_mask"].to(self.device)
+                    
                     batch_size = x.size(0)
                     batch_indices = torch.arange(
                         batch_size,
@@ -220,34 +261,42 @@ class FurnitureEmbeddingPredictor(nn.Module):
 
                     # Pick one REAL furniture item per room to hide.
                     # PAD positions have prob value 0, so they cannot be selected.
-                    mask_idx = torch.multinomial(valid_mask.float(),1).squeeze(1)
+                    mask_probs = valid_mask.float()
+                    if labeled_data: 
+                        mask_probs[:, 0] = 0.0
+
+                    mask_idx = torch.multinomial(mask_probs,1).squeeze(1)
 
                     # Save the true furniture embedding before masking.
                     true = x[batch_indices, mask_idx,:]
 
                     optimizer.zero_grad()
 
-                    # Transformer replaces the chosen real item with MASK.
-                    # valid_mask tells the Transformer which positions are PAD.
-                    pred = self.forward(x,valid_mask,mask_idx)
+                    # Forward pass returning candidate predictions and confidence logits
+                    preds, conf_logits = self.forward(x, valid_mask, mask_idx, return_confidence=True)
+                    true_norm = F.normalize(true, p=2, dim=-1)
+
+                    # Winner-Take-All: determine which candidate head is closest to the ground truth
+                    head_sims = torch.sum(preds * true_norm.unsqueeze(1), dim=-1)  # shape: [batch_size, num_candidates]
+                    winner_idx = torch.argmax(head_sims, dim=-1)                    # shape: [batch_size]
+                    winning_preds = preds[batch_indices, winner_idx, :]            # shape: [batch_size, embed_dim]
 
                     if loss_type == "infonce":
-                        # In-batch contrastive / InfoNCE loss
-                        true_norm = F.normalize(true, p=2, dim=-1)
-                        # Cosine similarity matrix between predictions and in-batch targets
-                        sim_matrix = torch.matmul(pred, true_norm.T) / temperature
+                        # In-batch contrastive / InfoNCE loss on the winning candidate
+                        sim_matrix = torch.matmul(winning_preds, true_norm.T) / temperature
                         targets = torch.arange(batch_size, device=self.device)
-                        loss = F.cross_entropy(sim_matrix, targets)
-                    
+                        embed_loss = F.cross_entropy(sim_matrix, targets)
                     elif loss_type == "cosine":
-                        pair_flags = torch.ones(batch_size, device=self.device)
-                        loss = cos_loss(
-                            pred,
-                            true,
-                            pair_flags
-                        )
+                        embed_loss = (1.0 - head_sims[batch_indices, winner_idx]).mean()
                     else:
                         raise ValueError(f"Unknown loss_type: {loss_type}. Choose 'infonce' or 'cosine'.")
+
+                    # Confidence loss: train the certainty head to predict which candidate won
+                    if self.num_candidates > 1:
+                        conf_loss = F.cross_entropy(conf_logits, winner_idx)
+                        loss = embed_loss + conf_weight * conf_loss
+                    else:
+                        loss = embed_loss
 
                     loss.backward()
                     optimizer.step()
@@ -299,34 +348,22 @@ class TransformerEvaluator:
         self,
         model: FurnitureEmbeddingPredictor,
         item_descriptions: list[str] = None,
-        item_ids: list[int] = None,
-        item_embeddings: torch.Tensor = None,
-        return_strings = True
+        aggregation = "confidence_weighted_max",
     ):
         self.model = model.to("cpu")
         self.model.eval()
-        self.item_ids = item_ids
         self.item_descs = item_descriptions
-        
-        if item_embeddings is not None:
-            if item_descriptions is None:
-                raise ValueError("item_descriptions are required alongside item_embeddings")
-            if item_embeddings.ndim != 2 or item_embeddings.shape[0] != len(item_descriptions):
-                raise ValueError(
-                    "item_embeddings must have one 2-D row for every item description"
-                )
-            if item_embeddings.shape[1] != model.embed_dim:
-                raise ValueError(
-                    f"item_embeddings must have dimension {model.embed_dim}, "
-                    f"got {item_embeddings.shape[1]}"
-                )
-        self.return_strings = return_strings
-        self.item_embeddings = item_embeddings.cpu() if item_embeddings is not None else None
+        self.aggregation = aggregation
+    
+        self.item_embeddings = None
         self.sbert = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device="cpu")
+        self.ensure_item_embeddings()
+        self.desc_to_emb = dict(zip(self.item_descs, self.item_embeddings))
+
+
+
 
     def predict(self, room: list[str], k: int = 1) -> list:
-        self.ensure_item_embeddings()
-        
         if not room:
             raise ValueError("room must contain at least one item description")
         if self.item_descs is None:
@@ -335,36 +372,91 @@ class TransformerEvaluator:
             raise ValueError("k must be at least 1")
         
         with torch.no_grad():
-            embedding: torch.Tensor = self.sbert.encode(
-                room,
-                convert_to_tensor=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                ) # will have dim (n, embed_dim)
-            embedding_cpu = embedding.unsqueeze(dim=0).cpu()
-            #print(f"room embedding shape: {embedding.shape}, mask shape: {self.model.mask_token.shape}")
+            for item in room:
+                if item not in self.desc_to_emb:
+                    self.desc_to_emb[item] = self.sbert.encode(
+                                        item,
+                                        convert_to_tensor=True,
+                                        normalize_embeddings=True,
+                                        show_progress_bar=False,
+                                        )
+                    print(f"Did not find embedding for: {item}")
 
-            embedding_masked = torch.cat([embedding_cpu, self.model.mask_token], dim = 1)
+            embedding = torch.stack([self.desc_to_emb[item] for item in room], dim=0).unsqueeze(dim=0).cpu()
+            embedding_masked = torch.cat([embedding, self.model.mask_token], dim = 1)
             valid_mask = torch.ones((1, embedding_masked.shape[1])).bool() # (1, n)
-            prediction = self.model.forward(embedding_masked, valid_mask, mask_index=-1) # (1, embed_dim)
-            sims = self.sbert.similarity(prediction, self.item_embeddings)[0]
+            preds, conf_logits = self.model.forward(embedding_masked, valid_mask, mask_index=-1, return_confidence=True)
+            
+            probs = F.softmax(conf_logits, dim=-1)[0]
+            catalog = F.normalize(self.item_embeddings, p=2, dim=-1)
+            head_sims = torch.matmul(preds[0], catalog.T)
+
+            if self.aggregation == "weighted":
+                sims = torch.matmul(probs, head_sims)
+            elif self.aggregation == "confidence_weighted_max":
+                sims = torch.max(head_sims * probs.unsqueeze(1), dim=0).values
+            else:  # "max" (default)
+                sims = torch.max(head_sims, dim=0).values
+
             rankings = torch.argsort(sims, descending=True)
             ranked_strings = []
-            ranked_ids = []
             present_items = set(room)
             
             for ranking in rankings:
                 item = self.item_descs[int(ranking)]
-                item_id = self.item_ids[int(ranking)]
+                #item_id = self.item_ids[int(ranking)]
                 if item not in present_items:
                     ranked_strings.append(item)
-                    ranked_ids.append(item_id)
+                    #ranked_ids.append(item_id)
                 if len(ranked_strings) == k:
                     break
-            
-            if self.return_strings:
-                return ranked_strings
-            return ranked_ids
+
+            return ranked_strings
+  
+
+    def predict_choices(self, room: list[str], k_per_head: int = 1) -> list[dict]:
+        """Returns predictions broken down by individual candidate heads with their confidence probabilities."""
+        if not room:
+            raise ValueError("room must contain at least one item description")
+
+        with torch.no_grad():
+            embedding = self.sbert.encode(
+                room,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).unsqueeze(dim=0).cpu()
+
+            embedding_masked = torch.cat([embedding, self.model.mask_token], dim=1)
+            valid_mask = torch.ones((1, embedding_masked.shape[1])).bool()
+
+            preds, conf_logits = self.model.forward(
+                embedding_masked, valid_mask, mask_index=-1, return_confidence=True
+            )
+            probs = F.softmax(conf_logits, dim=-1)[0].tolist()
+            catalog = F.normalize(self.item_embeddings, p=2, dim=-1)
+            head_sims = torch.matmul(preds[0], catalog.T)
+
+            present_items = set(room)
+            choices = []
+            for m in range(self.model.num_candidates):
+                rankings = torch.argsort(head_sims[m], descending=True)
+                items = []
+                for r in rankings:
+                    idx = int(r)
+                    item = self.item_descs[idx] if self.return_strings else self.item_ids[idx]
+                    if self.item_descs[idx] not in present_items:
+                        items.append(item)
+                    if len(items) == k_per_head:
+                        break
+                choices.append({
+                    "head": m,
+                    "confidence": float(probs[m]),
+                    "predictions": items,
+                })
+
+            choices.sort(key=lambda x: x["confidence"], reverse=True)
+            return choices
 
     def ensure_item_embeddings(self):
         if self.item_embeddings is not None:

@@ -3,7 +3,7 @@ from src.evaluation.metrics import recall_at_k, ndcg_at_k
 from tqdm import tqdm
 
 class LeaveOneOutEvaluator:
-    def evaluate(self, model, test_rooms, k):
+    def evaluate(self, model, test_rooms, k, labeled: bool = False):
         random.seed(42)
         
         total_recall = 0.0
@@ -18,8 +18,11 @@ class LeaveOneOutEvaluator:
 
             # room copy so we dont interfere with real data
             room_copy = room.copy()
-            random_index = random.randint(0, len(room_copy) - 1)
-
+            if labeled:
+                random_index = random.randint(1, len(room_copy) - 1)
+            else: 
+                random_index = random.randint(0, len(room_copy) - 1)
+                
             # target item will be randomized from copied room
             target_item = room_copy.pop(random_index)
             partial_room = room_copy # rest of the item inside the roomn = partial room

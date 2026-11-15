@@ -2,7 +2,11 @@ import unittest
 import torch
 import numpy as np
 from unittest.mock import patch, MagicMock
-from src.models.transformer import FurnitureEmbeddingPredictor, calculate_running_average
+from src.models.transformer import (
+    FurnitureEmbeddingPredictor,
+    TransformerEvaluator,
+    calculate_running_average,
+)
 
 
 class TestTransformer(unittest.TestCase):
@@ -29,8 +33,25 @@ class TestTransformer(unittest.TestCase):
         self.assertEqual(len(avg_long), 20)
         self.assertAlmostEqual(avg_long[-1], 2.0)
 
-    def test_fit_infonce_loss(self):
-        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
+    def test_forward_single_and_multi_head(self):
+        # Single head
+        model_1 = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=1, device="cpu")
+        x = torch.randn(2, 4, 16)
+        mask = torch.ones(2, 4, dtype=torch.bool)
+        out_1 = model_1.forward(x, mask, mask_index=1)
+        self.assertEqual(out_1.shape, (2, 16))
+
+        # Multi head
+        model_3 = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=3, device="cpu")
+        out_3 = model_3.forward(x, mask, mask_index=1)
+        self.assertEqual(out_3.shape, (2, 3, 16))
+
+        preds, conf = model_3.forward(x, mask, mask_index=1, return_confidence=True)
+        self.assertEqual(preds.shape, (2, 3, 16))
+        self.assertEqual(conf.shape, (2, 3))
+
+    def test_fit_multi_head_wta_infonce(self):
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=3, device="cpu")
         batch_size = 4
         room_len = 5
         dummy_batch = {
@@ -39,12 +60,12 @@ class TestTransformer(unittest.TestCase):
         }
         train_loader = [dummy_batch, dummy_batch]
 
-        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="infonce", temperature=0.1)
+        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="infonce", temperature=0.1, conf_weight=0.2)
         self.assertEqual(len(losses), 2)
         self.assertTrue(all(isinstance(l, float) for l in losses))
 
-    def test_fit_cosine_loss(self):
-        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
+    def test_fit_multi_head_wta_cosine(self):
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=3, device="cpu")
         batch_size = 4
         room_len = 5
         dummy_batch = {
@@ -53,7 +74,7 @@ class TestTransformer(unittest.TestCase):
         }
         train_loader = [dummy_batch]
 
-        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="cosine")
+        losses = model.fit(train_loader, epochs=1, live_plot=False, loss_type="cosine", conf_weight=0.2)
         self.assertEqual(len(losses), 1)
         self.assertTrue(all(isinstance(l, float) for l in losses))
 
@@ -69,7 +90,7 @@ class TestTransformer(unittest.TestCase):
     @patch("matplotlib.pyplot.show")
     @patch("matplotlib.pyplot.pause")
     def test_fit_with_live_plot_enabled(self, mock_pause, mock_show):
-        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, device="cpu")
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=3, device="cpu")
 
         batch_size = 2
         room_len = 3
@@ -83,6 +104,37 @@ class TestTransformer(unittest.TestCase):
         self.assertEqual(len(losses), 3)
         self.assertTrue(mock_pause.called)
         self.assertTrue(mock_show.called)
+
+    @patch("src.models.transformer.SentenceTransformer")
+    def test_evaluator_multi_head(self, mock_sbert_cls):
+        mock_sbert = MagicMock()
+        mock_sbert.encode.return_value = torch.randn(2, 16)
+        mock_sbert_cls.return_value = mock_sbert
+
+        model = FurnitureEmbeddingPredictor(embed_dim=16, hid_dim=32, nhead=2, num_layers=1, num_candidates=3, device="cpu")
+        item_descs = ["chair", "table", "bed", "lamp"]
+        item_ids = [101, 102, 103, 104]
+        item_embeddings = torch.randn(4, 16)
+
+        evaluator = TransformerEvaluator(
+            model=model,
+            item_descriptions=item_descs,
+            item_ids=item_ids,
+            item_embeddings=item_embeddings,
+            return_strings=True,
+            aggregation="max",
+        )
+
+        preds = evaluator.predict(["chair", "table"], k=2)
+        self.assertEqual(len(preds), 2)
+        self.assertNotIn("chair", preds)
+        self.assertNotIn("table", preds)
+
+        choices = evaluator.predict_choices(["chair", "table"], k_per_head=1)
+        self.assertEqual(len(choices), 3)
+        self.assertTrue("head" in choices[0])
+        self.assertTrue("confidence" in choices[0])
+        self.assertTrue("predictions" in choices[0])
 
 
 if __name__ == "__main__":
