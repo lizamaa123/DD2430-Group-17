@@ -48,12 +48,17 @@ class TransformersBackend:
 
     enforces_schema = False
 
-    def __init__(self, model_name=config.DEFAULT_MODEL, device=None, max_new_tokens=config.MAX_NEW_TOKENS):
+    def __init__(self, model_name=config.DEFAULT_MODEL, device=None, max_new_tokens=config.MAX_NEW_TOKENS,
+                 dtype="auto"):
         """
         Args:
             model_name: Hugging Face model ID.
             device: "cuda", "mps" or "cpu". Picked automatically if None.
             max_new_tokens: Upper limit on the answer length.
+            dtype: Number format of the weights: "auto" (the model's own,
+                bf16 for Qwen3.5), "float16", "bfloat16" or "float32".
+                GPUs without bf16 support (e.g. Kaggle's T4) are about 10x
+                faster with "float16".
         """
         import torch
         from transformers import AutoProcessor
@@ -79,8 +84,9 @@ class TransformersBackend:
         # Batched generation needs the padding on the left, so every answer
         # starts right after its own prompt.
         self.processor.tokenizer.padding_side = "left"
-        self.model = AutoModelClass.from_pretrained(model_name, dtype="auto").to(device).eval()
-        print(f"Loaded {model_name} on {device}")
+        torch_dtype = "auto" if dtype == "auto" else getattr(torch, dtype)
+        self.model = AutoModelClass.from_pretrained(model_name, dtype=torch_dtype).to(device).eval()
+        print(f"Loaded {model_name} on {device} ({self.model.dtype})")
 
     def generate(self, requests, sampling=None):
         """
@@ -234,7 +240,7 @@ def make_backend(name, **kwargs):
         A backend object with a generate(requests, sampling=None) method.
     """
     if name == "transformers":
-        keys = ("model_name", "device", "max_new_tokens")
+        keys = ("model_name", "device", "max_new_tokens", "dtype")
         return TransformersBackend(**{k: v for k, v in kwargs.items() if k in keys and v is not None})
     if name == "server":
         keys = ("model_name", "base_url", "api_key", "workers", "use_schema", "max_new_tokens")

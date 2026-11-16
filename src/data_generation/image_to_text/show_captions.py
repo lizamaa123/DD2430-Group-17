@@ -36,7 +36,7 @@ ITEMS_PER_PAGE = 6  # shown as 2 rows of 3
 MAX_PAGES = 5  # stop after this many pages; None for all
 
 # Only show some items (None = no filter):
-CATEGORY = "curtain"  # a DeepFurniture category, "cabinet#shelf", "lamp", "door", "decoration", 
+CATEGORY = None  # a DeepFurniture category, "cabinet#shelf", "lamp", "door", "decoration", 
 #"curtain", "chair#stool", "bed", "plant", "table", "sofa" or "home-appliance"
 ONLY = None  # "uncertain", "problems" (anything flagged by the checks) or "invalid"
 

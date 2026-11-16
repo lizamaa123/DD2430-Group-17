@@ -60,6 +60,9 @@ RETRY_INVALID = False  # True: redo items whose saved answer was unusable
 
 # Only for BACKEND = "transformers"
 DEVICE = None  # "cuda", "mps" or "cpu"; None picks automatically
+# "auto": the model's own format (bf16 for Qwen3.5). "float16" is about 10x
+# faster on GPUs without bf16 support, e.g. Kaggle's T4. Also "bfloat16", "float32".
+DTYPE = "auto"
 
 # Only for BACKEND = "server"
 SERVER_URL = "http://localhost:8000/v1"  # vLLM default; LM Studio uses http://localhost:1234/v1
@@ -190,6 +193,7 @@ def main():
         BACKEND,
         model_name=MODEL,
         device=DEVICE,
+        dtype=DTYPE,
         base_url=SERVER_URL,
         api_key=SERVER_API_KEY,
         workers=SERVER_WORKERS,
