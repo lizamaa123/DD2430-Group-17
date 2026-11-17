@@ -30,7 +30,7 @@ from src.data_generation.image_to_text.dataset import find_captions_file, load_c
 # ===========================================================================
 
 # The file name printed at the end of run_captioning.py.
-CAPTIONS_FILE = "pilot_Qwen3.5-0.8B_full_v2.jsonl"
+CAPTIONS_FILE = "full_Qwen3.5-2B_full_v2.jsonl"
 
 ITEMS_PER_PAGE = 6  # shown as 2 rows of 3
 MAX_PAGES = 5  # stop after this many pages; None for all
