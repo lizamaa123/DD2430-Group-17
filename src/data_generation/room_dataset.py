@@ -1,15 +1,57 @@
 import json
 import torch
 from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from item_encoder import MODEL_NAME
+from sentence_transformers import SentenceTransformer
+
+from src.data_generation.item_encoder import load_item_catalog
 
 
-ROOMS_PATH = "data/synthetic_rooms.json"
-EMBEDDINGS_PATH = "data/item_embeddings.pt"
-ROOMS_PATH_DF = "data/deepfuniture_rooms.json"
-EMBEDDINGS_PATH_DF_CAPTIONS = "data/item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
-EMBEDDINGS_PATH_DF_SHORT = "data/item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+ROOMS_PATH = PROJECT_ROOT / "data" / "synthetic_rooms.json"
+EMBEDDINGS_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
+ROOMS_PATH_DF = PROJECT_ROOT / "data" / "deepfuniture_rooms.json"
+EMBEDDINGS_PATH_DF_CAPTIONS = PROJECT_ROOT / "data" / "item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
+EMBEDDINGS_PATH_DF_SHORT = PROJECT_ROOT / "data" / "item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
 
 EMBED_DIM = 384
+
+
+def load_rooms_as_descriptions(split="test", labeled: bool = True):
+    """Load generated rooms as lists of canonical catalog descriptions."""
+    with open(ROOMS_PATH, "r") as f:
+        rooms = json.load(f)
+
+    item_ids, descriptions = load_item_catalog()
+    descriptions_by_id = dict(zip(item_ids, descriptions))
+    selected_rooms = [room for room in rooms if room["split"] == split]
+
+    missing_ids = {
+        item_id
+        for room in selected_rooms
+        for item_id in room["item_ids"]
+        if item_id not in descriptions_by_id
+    }
+    if missing_ids:
+        raise KeyError(
+            f"Generated rooms contain {len(missing_ids)} IDs absent from the catalog; "
+            f"first missing ID: {next(iter(missing_ids))}"
+        )
+
+    if not labeled:
+        return [
+            [descriptions_by_id[item_id] for item_id in room["item_ids"]]
+            for room in selected_rooms
+        ]
+    
+    return [
+        [room["room_type"].replace("_", " ")] + [descriptions_by_id[item_id] for item_id in room["item_ids"]]
+        for room in selected_rooms
+    ]
+    
+
 
 
 class RoomDataset(Dataset):
@@ -26,6 +68,7 @@ class RoomDataset(Dataset):
         else:
             rooms_path = ROOMS_PATH
             embeddings_path = EMBEDDINGS_PATH
+    def __init__(self, split="train", labeled: bool = True, sbert: SentenceTransformer = None):
 
         # Load synthetic rooms
         with open(rooms_path, "r") as f:
@@ -34,6 +77,21 @@ class RoomDataset(Dataset):
         # Keep only train / val / test rooms
         self.rooms = [room for room in rooms if room["split"] == split]
         self.item_embeddings = torch.load(embeddings_path, weights_only=False)
+
+        self.labeled = labeled
+        # Load Sentence-BERT embeddings
+        self.item_embeddings = torch.load(EMBEDDINGS_PATH, weights_only=False)
+        if labeled:
+            room_types = sorted(list({room["room_type"] for room in self.rooms}))
+            type_texts = [rt.replace("_", " ") for rt in room_types]
+            if sbert is None:
+                sbert = SentenceTransformer(MODEL_NAME)
+            embeddings = sbert.encode(
+                    type_texts,
+                    convert_to_tensor=True,
+                    normalize_embeddings=True
+                )
+            self.room_type_embeddings = {room_type: emb.cpu() for emb, room_type in zip(embeddings, type_texts)}
 
 
     def __len__(self):
@@ -48,24 +106,30 @@ class RoomDataset(Dataset):
         # Convert each furniture ID into its 384-D embedding
         embeddings = torch.stack([self.item_embeddings[item_id] for item_id in item_ids])
 
-        return {
+        item = {
             "embeddings": embeddings,
             "item_ids": torch.tensor(
                 item_ids,
                 dtype=torch.long
             ),
-            "room_type": room["room_type"],
+            "room_type": room["room_type"]
         }
+        if self.labeled:
+            item["room_type_embedding"] = self.room_type_embeddings[room["room_type"].replace("_", " ")]
+        
+        return item
 
 """As all rooms do not contain the same amount of furniture, pytorch will not be able to stack diffrent enumarated rooms into one vector eg [3,384],[5,384],[4,384]
 This tells us room 1 contain 3 items and we havethe size of each vector 384.
 """
-def collate_rooms(batch):
+def collate_rooms(batch, labeled=False):
 
     batch_size = len(batch)
 
     # Find the largest room in this batch
     max_room_size = max(example["embeddings"].shape[0] for example in batch)
+    if labeled:
+        max_room_size += 1
 
     # Tensor for all room embeddings
     x = torch.zeros(batch_size, max_room_size, EMBED_DIM)
@@ -86,13 +150,15 @@ def collate_rooms(batch):
         room_len = embeddings.shape[0]
 
         # Add actual furniture
-        x[i, :room_len] = embeddings
-
-        # Mark real furniture positions
-        valid_mask[i, :room_len] = True
-
-        # Save item IDs
-        item_ids[i, :room_len] = ids
+        if labeled:
+            x[i, 0] = example["room_type_embedding"]
+            x[i, 1:room_len+1] = embeddings
+            valid_mask[i, :room_len+1] = True
+            item_ids[i, 1:room_len+1] = ids
+        else:
+            x[i, :room_len] = embeddings
+            valid_mask[i, :room_len] = True
+            item_ids[i, :room_len] = ids
 
         room_types.append(example["room_type"])
 
