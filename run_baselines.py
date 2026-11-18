@@ -9,8 +9,22 @@ def load_data():
         rooms_data = json.load(f)
         
     # splitting the rooms into training and testing based on pre-set splits 
+    """
+    # without room labels
     train_rooms = [[str(item) for item in room["item_ids"]] for room in rooms_data if room["split"] == "train"]
     test_rooms = [[str(item) for item in room["item_ids"]] for room in rooms_data if room["split"] == "test"]
+    """
+
+    # with room labels
+    train_rooms = [
+    {"room_type": room["room_type"], "item_ids": [str(item) for item in room["item_ids"]]}
+    for room in rooms_data if room["split"] == "train"
+    ]
+
+    test_rooms = [
+        {"room_type": room["room_type"], "item_ids": [str(item) for item in room["item_ids"]]}
+        for room in rooms_data if room["split"] == "test"
+    ]
 
     # loading and extracting item id from IKEA data for Item Content Baseline
     df = pd.read_csv("data/processed_ikea_data.csv")
@@ -29,7 +43,7 @@ if __name__ == "__main__":
     
     print(f"Loaded {len(train_rooms)} training rooms and {len(test_rooms)} test rooms.")
     
-    K = 10 # nr of guesses
+    K = 20 # nr of guesses
     evaluator = LeaveOneOutEvaluator()
 
     # ---------------------------------------------------------
