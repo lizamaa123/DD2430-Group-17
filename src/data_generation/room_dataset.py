@@ -5,23 +5,36 @@ from torch.utils.data import Dataset, DataLoader
 
 ROOMS_PATH = "data/synthetic_rooms.json"
 EMBEDDINGS_PATH = "data/item_embeddings.pt"
+ROOMS_PATH_DF = "data/deepfuniture_rooms.json"
+EMBEDDINGS_PATH_DF_CAPTIONS = "data/item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
+EMBEDDINGS_PATH_DF_SHORT = "data/item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
 
 EMBED_DIM = 384
 
 
 class RoomDataset(Dataset):
 
-    def __init__(self, split="train"):
+    def __init__(self, split="train", dataset: str = "synthetic"):
+        """dataset parameter can be synthetic, df_short, df_captions"""
+
+        if dataset == "df_short":
+            rooms_path = ROOMS_PATH_DF
+            embeddings_path = EMBEDDINGS_PATH_DF_SHORT
+        elif dataset == "df_captions":
+            rooms_path = ROOMS_PATH_DF
+            embeddings_path = EMBEDDINGS_PATH_DF_CAPTIONS
+        else:
+            rooms_path = ROOMS_PATH
+            embeddings_path = EMBEDDINGS_PATH
 
         # Load synthetic rooms
-        with open(ROOMS_PATH, "r") as f:
+        with open(rooms_path, "r") as f:
             rooms = json.load(f)
 
         # Keep only train / val / test rooms
         self.rooms = [room for room in rooms if room["split"] == split]
+        self.item_embeddings = torch.load(embeddings_path, weights_only=False)
 
-        # Load Sentence-BERT embeddings
-        self.item_embeddings = torch.load(EMBEDDINGS_PATH, weights_only=False)
 
     def __len__(self):
         return len(self.rooms)
