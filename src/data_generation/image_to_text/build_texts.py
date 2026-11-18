@@ -49,7 +49,7 @@ TEXT_VARIANTS = ("short", "medium", "rich", "caption")
 CAPTIONS_FILE = "full_Qwen3.5-2B_full_v2.jsonl"
 
 # Which text versions to build (see the top of this file).
-VARIANTS = ["short", "medium", "rich", "caption"]
+VARIANTS = ["short", "caption"]
 
 DROP_UNCERTAIN = False  # True: leave out items the model was unsure about
 MAKE_EMBEDDINGS = True  # False: only write the texts CSV
