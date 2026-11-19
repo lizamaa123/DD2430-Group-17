@@ -12,19 +12,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 ROOMS_PATH = PROJECT_ROOT / "data" / "synthetic_rooms.json"
 EMBEDDINGS_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
-ROOMS_PATH_DF = PROJECT_ROOT / "data" / "deepfuniture_rooms.json"
+ROOMS_PATH_DF = PROJECT_ROOT / "data" / "deepfurniture_rooms.json"
 EMBEDDINGS_PATH_DF_CAPTIONS = PROJECT_ROOT / "data" / "item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
 EMBEDDINGS_PATH_DF_SHORT = PROJECT_ROOT / "data" / "item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
 
 EMBED_DIM = 384
 
 
-def load_rooms_as_descriptions(split="test", labeled: bool = True):
+def load_rooms_as_descriptions(split="test", labeled: bool = True, dataset:str = "synthetic"):
     """Load generated rooms as lists of canonical catalog descriptions."""
-    with open(ROOMS_PATH, "r") as f:
+    
+    if dataset == "df_short":
+        rooms_path = ROOMS_PATH_DF
+        csv_path = PROJECT_ROOT / "data" / "df_short.csv"
+    elif dataset == "df_captions":
+        rooms_path = ROOMS_PATH_DF
+        csv_path = PROJECT_ROOT / "data" / "df_captions.csv"
+    else:
+        rooms_path = ROOMS_PATH
+        csv_path =  PROJECT_ROOT / "data" / "processed_ikea_data.csv"
+    
+    
+    with open(rooms_path, "r") as f:
         rooms = json.load(f)
 
-    item_ids, descriptions = load_item_catalog()
+    item_ids, descriptions = load_item_catalog(data_path=csv_path)
     descriptions_by_id = dict(zip(item_ids, descriptions))
     selected_rooms = [room for room in rooms if room["split"] == split]
 
@@ -56,8 +68,7 @@ def load_rooms_as_descriptions(split="test", labeled: bool = True):
 
 class RoomDataset(Dataset):
 
-    def __init__(self, split="train", dataset: str = "synthetic"):
-        """dataset parameter can be synthetic, df_short, df_captions"""
+    def __init__(self, split="train", labeled: bool = True, dataset: str = "synthetic", sbert: SentenceTransformer = None):
 
         if dataset == "df_short":
             rooms_path = ROOMS_PATH_DF
@@ -68,7 +79,6 @@ class RoomDataset(Dataset):
         else:
             rooms_path = ROOMS_PATH
             embeddings_path = EMBEDDINGS_PATH
-    def __init__(self, split="train", labeled: bool = True, sbert: SentenceTransformer = None):
 
         # Load synthetic rooms
         with open(rooms_path, "r") as f:
@@ -79,8 +89,6 @@ class RoomDataset(Dataset):
         self.item_embeddings = torch.load(embeddings_path, weights_only=False)
 
         self.labeled = labeled
-        # Load Sentence-BERT embeddings
-        self.item_embeddings = torch.load(EMBEDDINGS_PATH, weights_only=False)
         if labeled:
             room_types = sorted(list({room["room_type"] for room in self.rooms}))
             type_texts = [rt.replace("_", " ") for rt in room_types]

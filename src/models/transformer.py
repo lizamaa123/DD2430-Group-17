@@ -342,111 +342,122 @@ class FurnitureEmbeddingPredictor(nn.Module):
 
 
 class TransformerEvaluator:
-    """Evaluate a transformer against an ordered item catalog."""
+    """Evaluate a transformer against a catalog using precomputed embeddings."""
 
     def __init__(
         self,
         model: FurnitureEmbeddingPredictor,
-        item_descriptions: list[str] = None,
-        aggregation = "confidence_weighted_max",
+        item_embeddings: dict[int, torch.Tensor] | torch.Tensor,
+        item_ids: list[int] = None,
+        aggregation: str = "confidence_weighted_max",
+        filter_present: bool = True,
     ):
         self.model = model.to("cpu")
         self.model.eval()
-        self.item_descs = item_descriptions
         self.aggregation = aggregation
-    
-        self.item_embeddings = None
-        self.sbert = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device="cpu")
-        self.ensure_item_embeddings()
-        self.desc_to_emb = dict(zip(self.item_descs, self.item_embeddings))
+        self.filter_present = filter_present
 
+        # Case 1: item_embeddings is a dictionary {item_id: Tensor(embed_dim)}
+        if isinstance(item_embeddings, dict):
+            self.id_to_emb = {k: v.cpu() for k, v in item_embeddings.items()}
+            self.item_ids = list(self.id_to_emb.keys()) if item_ids is None else list(item_ids)
+            self.catalog_matrix = torch.stack([self.id_to_emb[iid] for iid in self.item_ids])
 
+        # Case 2: item_embeddings is a 2D Tensor of shape (N, embed_dim)
+        elif isinstance(item_embeddings, torch.Tensor):
+            if item_ids is None:
+                raise ValueError("item_ids must be provided when item_embeddings is a 2D Tensor")
+            self.item_ids = list(item_ids)
+            self.catalog_matrix = item_embeddings.cpu()
+            self.id_to_emb = {iid: emb for iid, emb in zip(self.item_ids, self.catalog_matrix)}
+        else:
+            raise TypeError("item_embeddings must be either a dict or a torch.Tensor")
 
+        # Pre-normalize catalog matrix once for fast cosine similarity dot products
+        self.catalog_norm = F.normalize(self.catalog_matrix, p=2, dim=-1)
 
-    def predict(self, room: list[str], k: int = 1) -> list:
+    def predict(self, room: list[int], k: int = 1) -> list[int]:
         if not room:
-            raise ValueError("room must contain at least one item description")
-        if self.item_descs is None:
-            raise ValueError("item_descriptions are required to return ranked item strings")
+            raise ValueError("room must contain at least one item ID")
         if k < 1:
             raise ValueError("k must be at least 1")
-        
+
         with torch.no_grad():
-            for item in room:
-                if item not in self.desc_to_emb:
-                    self.desc_to_emb[item] = self.sbert.encode(
-                                        item,
-                                        convert_to_tensor=True,
-                                        normalize_embeddings=True,
-                                        show_progress_bar=False,
-                                        )
-                    print(f"Did not find embedding for: {item}")
+            # 1. Look up embeddings for the input room items (shape: 1, seq_len, embed_dim)
+            embedding = torch.stack([self.id_to_emb[item_id] for item_id in room], dim=0).unsqueeze(0).cpu()
 
-            embedding = torch.stack([self.desc_to_emb[item] for item in room], dim=0).unsqueeze(dim=0).cpu()
-            embedding_masked = torch.cat([embedding, self.model.mask_token], dim = 1)
-            valid_mask = torch.ones((1, embedding_masked.shape[1])).bool() # (1, n)
-            preds, conf_logits = self.model.forward(embedding_masked, valid_mask, mask_index=-1, return_confidence=True)
-            
-            probs = F.softmax(conf_logits, dim=-1)[0]
-            catalog = F.normalize(self.item_embeddings, p=2, dim=-1)
-            head_sims = torch.matmul(preds[0], catalog.T)
+            # 2. Append mask token
+            mask_token = self.model.mask_token.to(embedding.device)
+            embedding_masked = torch.cat([embedding, mask_token], dim=1)
+            valid_mask = torch.ones((1, embedding_masked.shape[1]), dtype=torch.bool, device=embedding.device)
 
+            # 3. Predict candidate vectors & confidence logits
+            preds, conf_logits = self.model.forward(
+                embedding_masked, valid_mask, mask_index=-1, return_confidence=True
+            )
+
+            # 4. Cosine similarity against normalized catalog
+            probs = F.softmax(conf_logits, dim=-1)[0]  # shape: (num_candidates,)
+            head_sims = torch.matmul(preds[0], self.catalog_norm.T)  # shape: (num_candidates, N)
+
+            # 5. Aggregate candidate heads
             if self.aggregation == "weighted":
                 sims = torch.matmul(probs, head_sims)
             elif self.aggregation == "confidence_weighted_max":
                 sims = torch.max(head_sims * probs.unsqueeze(1), dim=0).values
-            else:  # "max" (default)
+            else:  # "max"
                 sims = torch.max(head_sims, dim=0).values
 
+            # 6. Sort candidate indices descending
             rankings = torch.argsort(sims, descending=True)
-            ranked_strings = []
-            present_items = set(room)
-            
-            for ranking in rankings:
-                item = self.item_descs[int(ranking)]
-                #item_id = self.item_ids[int(ranking)]
-                if item not in present_items:
-                    ranked_strings.append(item)
-                    #ranked_ids.append(item_id)
-                if len(ranked_strings) == k:
+
+            # 7. Map row indices back to item IDs
+            ranked_ids = []
+            seen = set()
+            present_items = set(room) if self.filter_present else set()
+
+            for r in rankings:
+                idx = int(r)
+                predicted_id = self.item_ids[idx]
+
+                if predicted_id not in present_items and predicted_id not in seen:
+                    seen.add(predicted_id)
+                    ranked_ids.append(predicted_id)
+
+                if len(ranked_ids) == k:
                     break
 
-            return ranked_strings
-  
+            return ranked_ids
 
-    def predict_choices(self, room: list[str], k_per_head: int = 1) -> list[dict]:
-        """Returns predictions broken down by individual candidate heads with their confidence probabilities."""
+    def predict_choices(self, room: list[int], k_per_head: int = 1) -> list[dict]:
+        """Returns predictions broken down by individual candidate head."""
         if not room:
-            raise ValueError("room must contain at least one item description")
+            raise ValueError("room must contain at least one item ID")
 
         with torch.no_grad():
-            embedding = self.sbert.encode(
-                room,
-                convert_to_tensor=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            ).unsqueeze(dim=0).cpu()
-
-            embedding_masked = torch.cat([embedding, self.model.mask_token], dim=1)
-            valid_mask = torch.ones((1, embedding_masked.shape[1])).bool()
+            embedding = torch.stack([self.id_to_emb[item_id] for item_id in room], dim=0).unsqueeze(0).cpu()
+            mask_token = self.model.mask_token.to(embedding.device)
+            embedding_masked = torch.cat([embedding, mask_token], dim=1)
+            valid_mask = torch.ones((1, embedding_masked.shape[1]), dtype=torch.bool, device=embedding.device)
 
             preds, conf_logits = self.model.forward(
                 embedding_masked, valid_mask, mask_index=-1, return_confidence=True
             )
             probs = F.softmax(conf_logits, dim=-1)[0].tolist()
-            catalog = F.normalize(self.item_embeddings, p=2, dim=-1)
-            head_sims = torch.matmul(preds[0], catalog.T)
+            head_sims = torch.matmul(preds[0], self.catalog_norm.T)
 
-            present_items = set(room)
+            present_items = set(room) if self.filter_present else set()
             choices = []
             for m in range(self.model.num_candidates):
                 rankings = torch.argsort(head_sims[m], descending=True)
                 items = []
+                seen = set()
                 for r in rankings:
                     idx = int(r)
-                    item = self.item_descs[idx] if self.return_strings else self.item_ids[idx]
-                    if self.item_descs[idx] not in present_items:
-                        items.append(item)
+                    iid = self.item_ids[idx]
+                    if iid not in present_items and iid not in seen:
+                        seen.add(iid)
+                        items.append(iid)
                     if len(items) == k_per_head:
                         break
                 choices.append({
@@ -457,30 +468,6 @@ class TransformerEvaluator:
 
             choices.sort(key=lambda x: x["confidence"], reverse=True)
             return choices
-
-    def ensure_item_embeddings(self):
-        if self.item_embeddings is not None:
-            return
-        if self.item_descs is None:
-            raise ValueError("item_descriptions are required to build the candidate embedding matrix")
-
-        self.item_embeddings = self.sbert.encode(
-            self.item_descs,
-            convert_to_tensor=True,
-            normalize_embeddings=True,
-            show_progress_bar=True,
-            )
-        
-
-
-if __name__ == '__main__':
-    model = FurnitureEmbeddingPredictor()
-    evaluator = TransformerEvaluator(model, item_descriptions=["chair", "wierd snake", "bedside table", "owen", "blender", "swimingpool"])
-
-    prediction = evaluator.predict(["bed", "table"], k=1)
-    print(prediction)
-
-
 
 """
 x

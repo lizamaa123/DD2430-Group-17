@@ -7,7 +7,12 @@ from sentence_transformers import SentenceTransformer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = PROJECT_ROOT / "data" / "processed_ikea_data.csv"
+DATA_PATH_SHORT = PROJECT_ROOT / "data" / "df_short.csv"
+DATA_PATH_CAPTIONS = PROJECT_ROOT / "data" / "df_captions.csv"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
+
+EMBEDDINGS_PATH_DF_CAPTIONS = PROJECT_ROOT / "data" / "item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
+EMBEDDINGS_PATH_DF_SHORT = PROJECT_ROOT / "data" / "item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 
