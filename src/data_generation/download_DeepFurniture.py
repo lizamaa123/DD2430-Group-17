@@ -1571,7 +1571,7 @@ def show_dataset_statistics(
 
 
 if __name__ == "__main__":
-    visualize_random_scenes(num_scenes=3, sample_from_first_n=20)
+    visualize_random_scenes(num_scenes=10)
     #find_and_show_duplicate_scenes(num_groups=3)
     #find_and_show_similar_scenes(num_pairs=3, min_overlap=0.4, max_overlap=0.45)
     #show_dataset_statistics()

@@ -13,3 +13,6 @@ data/
 *.pth
 .ipynb_checkpoints/
 .DS_Store
+
+# Personal Claude Code notes
+CLAUDE.local.md
