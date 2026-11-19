@@ -28,9 +28,9 @@ BACKENDS = ("transformers", "server", "dry-run")
 
 @dataclass
 class Request:
-    """One item to describe."""
+    """One image to describe (a furniture item, or a scene in room_labelling)."""
 
-    furniture_id: str
+    item_id: str
     image_path: str
     prompt: str
     schema: dict

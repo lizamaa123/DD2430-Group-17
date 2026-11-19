@@ -125,7 +125,7 @@ def caption_items(items, backend, output_path, variant="full", batch_size=4, mod
             batch = todo[start:start + batch_size]
             requests = [
                 Request(
-                    furniture_id=item["furniture_id"],
+                    item_id=item["furniture_id"],
                     image_path=item["image_path"],
                     prompt=prompts.build_prompt(item["df_category"], variant),
                     schema=prompts.build_schema(item["df_category"], variant),
