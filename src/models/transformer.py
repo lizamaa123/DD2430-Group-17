@@ -535,6 +535,9 @@ class TransformerEvaluator:
         return_strings: bool = False,
         aggregation: str = "confidence_weighted_max",
         filter_present: bool = True,
+        train_rooms: list[list] = None,
+        item_counts: dict = None,
+        pop_weight: float = 0.0,
     ):
         self.model = model.to("cpu")
         self.model.eval()
@@ -542,6 +545,7 @@ class TransformerEvaluator:
         self.filter_present = filter_present
         self.item_descriptions = item_descriptions
         self.return_strings = return_strings
+        self.pop_weight = pop_weight
 
         # Case 1: item_embeddings is a dictionary {item_id: Tensor(embed_dim)}
         if isinstance(item_embeddings, dict):
@@ -564,6 +568,21 @@ class TransformerEvaluator:
 
         # Pre-normalize catalog matrix once for fast cosine similarity dot products
         self.catalog_norm = F.normalize(self.catalog_matrix, p=2, dim=-1)
+
+        # Optional normalized log-popularity tie-breaker aligned with self.item_ids
+        self.pop_bonus = None
+        if pop_weight > 0.0 and (item_counts is not None or train_rooms is not None):
+            if item_counts is None:
+                from collections import Counter
+                item_counts = Counter(iid for room in train_rooms for iid in room)
+            counts = torch.tensor(
+                [float(item_counts.get(iid, 0)) for iid in self.item_ids],
+                dtype=torch.float32,
+            )
+            log_counts = torch.log1p(counts)
+            max_log = log_counts.max()
+            if max_log > 0:
+                self.pop_bonus = log_counts / max_log
 
     def _get_item_emb(self, item):
         if item in self.id_to_emb:
@@ -595,6 +614,8 @@ class TransformerEvaluator:
             # 4. Cosine similarity against normalized catalog
             probs = F.softmax(conf_logits, dim=-1)[0]  # shape: (num_candidates,)
             head_sims = torch.matmul(preds[0], self.catalog_norm.T)  # shape: (num_candidates, N)
+            if self.pop_bonus is not None and self.pop_weight > 0.0:
+                head_sims = head_sims + self.pop_weight * self.pop_bonus.unsqueeze(0)
 
             # 5. Aggregate candidate heads
             if self.aggregation in ("interleaved", "sampled_interleaved"):
