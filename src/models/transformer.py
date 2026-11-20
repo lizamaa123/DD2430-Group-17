@@ -26,11 +26,12 @@ class FurnitureEmbeddingPredictor(nn.Module):
     def __init__(
         self,
         embed_dim=384,
-        hid_dim=256,
+        hid_dim=512,
         nhead=4,
         num_layers=3,
         num_candidates=3,
-        device=None,
+        dropout = 0.05,
+        device=None
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -47,10 +48,11 @@ class FurnitureEmbeddingPredictor(nn.Module):
             nhead=nhead,
             dim_feedforward=hid_dim,
             batch_first=True,
-            device=self.device
+            device=self.device,
+            dropout=dropout
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
         )
 
         # Multi-candidate projection head
@@ -156,6 +158,11 @@ class FurnitureEmbeddingPredictor(nn.Module):
 
         # logging
         train_batch_losses = []
+        train_batch_accs = []
+        train_head_wins = []
+        val_losses = []
+        val_accs = []
+        val_batch_indices = []
 
         loss_label = "InfoNCE Loss" if loss_type == "infonce" else "Cosine Loss"
 
@@ -163,9 +170,16 @@ class FurnitureEmbeddingPredictor(nn.Module):
         is_notebook = False
         display_handle = None
         fig = None
-        ax = None
+        ax_loss = None
+        ax_acc = None
+        ax_heads = None
         loss_line = None
-        smooth_line = None
+        smooth_loss_line = None
+        val_loss_line = None
+        acc_line = None
+        smooth_acc_line = None
+        val_acc_line = None
+        head_colors = [plt.get_cmap("tab10")(i % 10) for i in range(self.num_candidates)]
 
         if live_plot:
             try:
@@ -182,18 +196,44 @@ class FurnitureEmbeddingPredictor(nn.Module):
                 is_notebook = False
 
             plt.ion()
-            fig, ax = plt.subplots(figsize=(9, 5))
-            (loss_line,) = ax.plot(
-                [], [], label="Batch Loss", color="royalblue", alpha=0.5, linewidth=1
+            if self.num_candidates > 1:
+                fig, (ax_loss, ax_acc, ax_heads) = plt.subplots(1, 3, figsize=(19, 5))
+            else:
+                fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(14, 5))
+
+            # Loss Subplot
+            (loss_line,) = ax_loss.plot(
+                [], [], label="Train Batch Loss", color="royalblue", alpha=0.35, linewidth=1
             )
-            (smooth_line,) = ax.plot(
-                [], [], label="Running Avg (50 batches)", color="crimson", linewidth=1.8
+            (smooth_loss_line,) = ax_loss.plot(
+                [], [], label="Train Running Avg", color="royalblue", linewidth=1.8
             )
-            ax.set_title(f"Training Loss ({loss_label})")
-            ax.set_xlabel("Batch")
-            ax.set_ylabel(loss_label)
-            ax.grid(True, linestyle="--", alpha=0.6)
-            ax.legend(loc="upper right")
+            (val_loss_line,) = ax_loss.plot(
+                [], [], "o-", label="Val Loss", color="crimson", linewidth=2, markersize=5
+            )
+            ax_loss.set_title(f"Loss ({loss_label})")
+            ax_loss.set_xlabel("Batch")
+            ax_loss.set_ylabel(loss_label)
+            ax_loss.grid(True, linestyle="--", alpha=0.6)
+            ax_loss.legend(loc="upper right")
+
+            # Accuracy Subplot
+            (acc_line,) = ax_acc.plot(
+                [], [], label="Train Batch Acc", color="mediumseagreen", alpha=0.35, linewidth=1
+            )
+            (smooth_acc_line,) = ax_acc.plot(
+                [], [], label="Train Running Avg", color="mediumseagreen", linewidth=1.8
+            )
+            (val_acc_line,) = ax_acc.plot(
+                [], [], "o-", label="Val Acc", color="darkorange", linewidth=2, markersize=5
+            )
+            ax_acc.set_title("Top-1 Accuracy")
+            ax_acc.set_xlabel("Batch")
+            ax_acc.set_ylabel("Accuracy")
+            ax_acc.set_ylim(-0.02, 1.02)
+            ax_acc.grid(True, linestyle="--", alpha=0.6)
+            ax_acc.legend(loc="upper right")
+
             fig.tight_layout()
 
             if is_notebook:
@@ -207,24 +247,81 @@ class FurnitureEmbeddingPredictor(nn.Module):
                 except Exception:
                     pass
 
-        def _update_live_chart(epoch_idx: int, current_loss: float):
+        def _update_live_chart(epoch_idx: int, current_loss: float, current_acc: float):
             if fig is None or not plt.fignum_exists(fig.number):
                 return
             n_batches = len(train_batch_losses)
             if n_batches == 0:
                 return
             x_data = np.arange(1, n_batches + 1)
+
+            # Update Loss curves
             loss_line.set_data(x_data, train_batch_losses)
+            smooth_loss = calculate_running_average(train_batch_losses, window_size=50)
+            smooth_loss_line.set_data(x_data, smooth_loss)
+            if val_batch_indices and val_losses:
+                val_loss_line.set_data(val_batch_indices, val_losses)
 
-            smooth_vals = calculate_running_average(train_batch_losses, window_size=50)
-            smooth_line.set_data(x_data, smooth_vals)
-
-            ax.relim()
-            ax.autoscale_view()
-            ax.set_title(
-                f"Batch Training Loss ({loss_label}) - Epoch {epoch_idx + 1}/{epochs} | "
-                f"Batch {n_batches} | Loss: {current_loss:.4f}"
+            ax_loss.relim()
+            ax_loss.autoscale_view()
+            val_loss_str = f" | Val Loss: {val_losses[-1]:.4f}" if val_losses else ""
+            ax_loss.set_title(
+                f"Loss ({loss_label}) - Epoch {epoch_idx + 1}/{epochs} | "
+                f"Train: {current_loss:.4f}{val_loss_str}"
             )
+
+            # Update Accuracy curves
+            acc_line.set_data(x_data, train_batch_accs)
+            smooth_acc = calculate_running_average(train_batch_accs, window_size=50)
+            smooth_acc_line.set_data(x_data, smooth_acc)
+            if val_batch_indices and val_accs:
+                val_acc_line.set_data(val_batch_indices, val_accs)
+
+            ax_acc.relim()
+            ax_acc.autoscale_view()
+            ax_acc.set_ylim(-0.02, 1.02)
+            val_acc_str = f" | Val Acc: {val_accs[-1]:.4f}" if val_accs else ""
+            ax_acc.set_title(
+                f"Top-1 Accuracy - Epoch {epoch_idx + 1}/{epochs} | "
+                f"Train: {current_acc:.4f}{val_acc_str}"
+            )
+
+            # Update Winning Head distribution (100% stacked area chart)
+            if ax_heads is not None and train_head_wins:
+                wins_arr = np.array(train_head_wins)
+                smoothed_pcts = [
+                    calculate_running_average(wins_arr[:, h], window_size=50) * 100.0
+                    for h in range(self.num_candidates)
+                ]
+                latest_pcts = [float(smoothed_pcts[h][-1]) for h in range(self.num_candidates)]
+                ax_heads.clear()
+                ax_heads.stackplot(
+                    x_data,
+                    *smoothed_pcts,
+                    labels=[f"H{h}: {latest_pcts[h]:.1f}%" for h in range(self.num_candidates)],
+                    colors=head_colors,
+                    alpha=0.85,
+                )
+                ax_heads.set_ylim(0, 100)
+                ax_heads.set_xlim(1, max(n_batches, 2))
+                ax_heads.set_xlabel("Batch")
+                ax_heads.set_ylabel("Win Share (%)")
+                ax_heads.grid(True, linestyle="--", alpha=0.4)
+                legend_cols = 1 if self.num_candidates <= 7 else (2 if self.num_candidates <= 14 else 3)
+                legend_fs = "small" if self.num_candidates <= 7 else "x-small"
+                ax_heads.legend(loc="upper right", ncol=legend_cols, fontsize=legend_fs)
+                if self.num_candidates <= 4:
+                    latest_shares = " | ".join(
+                        f"H{h}: {latest_pcts[h]:.1f}%" for h in range(self.num_candidates)
+                    )
+                    ax_heads.set_title(f"Winning Head % - {latest_shares}")
+                else:
+                    active_count = sum(1 for p in latest_pcts if p > 1.0)
+                    top_head = int(np.argmax(latest_pcts))
+                    ax_heads.set_title(
+                        f"Winning Head % | Active (>1%): {active_count}/{self.num_candidates} "
+                        f"| Top: H{top_head} ({latest_pcts[top_head]:.1f}%)"
+                    )
 
             if is_notebook and display_handle is not None:
                 display_handle.update(fig)
@@ -244,6 +341,7 @@ class FurnitureEmbeddingPredictor(nn.Module):
                 self.train()
 
                 epoch_loss = 0
+                epoch_acc = 0
 
                 for batch in train_loader:
 
@@ -286,8 +384,12 @@ class FurnitureEmbeddingPredictor(nn.Module):
                         sim_matrix = torch.matmul(winning_preds, true_norm.T) / temperature
                         targets = torch.arange(batch_size, device=self.device)
                         embed_loss = F.cross_entropy(sim_matrix, targets)
+                        batch_acc = (sim_matrix.argmax(dim=-1) == targets).float().mean().item()
                     elif loss_type == "cosine":
                         embed_loss = (1.0 - head_sims[batch_indices, winner_idx]).mean()
+                        sim_matrix = torch.matmul(winning_preds, true_norm.T)
+                        batch_acc = (sim_matrix.argmax(dim=-1) == torch.arange(batch_size, device=self.device)).float().mean().item()
+                        #batch_acc = (head_sims[batch_indices, winner_idx] > 0.5).float().mean().item()
                     else:
                         raise ValueError(f"Unknown loss_type: {loss_type}. Choose 'infonce' or 'cosine'.")
 
@@ -302,19 +404,95 @@ class FurnitureEmbeddingPredictor(nn.Module):
                     optimizer.step()
                     batch_loss_val = loss.item()
                     epoch_loss += batch_loss_val
+                    epoch_acc += batch_acc
                     train_batch_losses.append(batch_loss_val)
+                    train_batch_accs.append(batch_acc)
+                    head_fracs = (
+                        torch.bincount(winner_idx, minlength=self.num_candidates).float() / batch_size
+                    )
+                    train_head_wins.append(head_fracs.detach().cpu().numpy())
 
                     if live_plot and (len(train_batch_losses) % plot_every == 0):
-                        _update_live_chart(epoch, batch_loss_val)
+                        _update_live_chart(epoch, batch_loss_val, batch_acc)
 
                     if debug_prints:
                         print(f"batch loss: {batch_loss_val}")
 
                 epoch_loss /= len(train_loader)
+                epoch_acc /= len(train_loader)
 
+                # Validation pass
+                val_loss = None
+                val_acc = None
+                if val_loader is not None:
+                    self.eval()
+                    total_val_loss = 0.0
+                    total_val_acc = 0.0
+                    val_batches = 0
+                    val_rng = torch.Generator(device=self.device).manual_seed(42 + epoch)
+
+                    with torch.no_grad():
+                        for val_batch in val_loader:
+                            x_val = val_batch["x"].to(self.device)
+                            valid_mask_val = val_batch["valid_mask"].to(self.device)
+                            b_size_val = x_val.size(0)
+                            if b_size_val < 2:
+                                continue
+
+                            b_indices_val = torch.arange(b_size_val, device=self.device)
+                            mask_probs_val = valid_mask_val.float()
+                            if labeled_data:
+                                mask_probs_val[:, 0] = 0.0
+
+                            mask_idx_val = torch.multinomial(mask_probs_val, 1, generator=val_rng).squeeze(1)
+                            true_val = x_val[b_indices_val, mask_idx_val, :]
+                            true_val_norm = F.normalize(true_val, p=2, dim=-1)
+
+                            preds_val, conf_logits_val = self.forward(
+                                x_val, valid_mask_val, mask_idx_val, return_confidence=True
+                            )
+                            head_sims_val = torch.sum(preds_val * true_val_norm.unsqueeze(1), dim=-1)
+                            winner_idx_val = torch.argmax(head_sims_val, dim=-1)
+                            winning_preds_val = preds_val[b_indices_val, winner_idx_val, :]
+
+                            targets_val = torch.arange(b_size_val, device=self.device)
+                            if loss_type == "infonce":
+                                sim_mat_val = torch.matmul(winning_preds_val, true_val_norm.T) / temperature
+                                e_loss_val = F.cross_entropy(sim_mat_val, targets_val)
+                                b_acc_val = (sim_mat_val.argmax(dim=-1) == targets_val).float().mean().item()
+                            else:
+                                e_loss_val = (1.0 - head_sims_val[b_indices_val, winner_idx_val]).mean()
+                                #b_acc_val = (head_sims_val[b_indices_val, winner_idx_val] > 0.5).float().mean().item()
+                                sim_matrix = torch.matmul(winning_preds, true_norm.T)
+                                b_acc_val = (sim_matrix.argmax(dim=-1) == torch.arange(batch_size, device=self.device)).float().mean().item()
+
+                            if self.num_candidates > 1:
+                                c_loss_val = F.cross_entropy(conf_logits_val, winner_idx_val)
+                                b_loss_val = e_loss_val + conf_weight * c_loss_val
+                            else:
+                                b_loss_val = e_loss_val
+
+                            total_val_loss += b_loss_val.item()
+                            total_val_acc += b_acc_val
+                            val_batches += 1
+
+                    if val_batches > 0:
+                        val_loss = total_val_loss / val_batches
+                        val_acc = total_val_acc / val_batches
+                        val_losses.append(val_loss)
+                        val_accs.append(val_acc)
+                        val_batch_indices.append(len(train_batch_losses))
+
+                    self.train()
+
+                if live_plot:
+                    _update_live_chart(epoch, batch_loss_val, batch_acc)
+
+                val_info = f", Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}" if val_loss is not None else ""
                 print(
-                    f"Average epoch training loss: "
-                    f"{epoch_loss:.4f}"
+                    f"Epoch {epoch + 1}/{epochs} - "
+                    f"Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}"
+                    f"{val_info}"
                 )
 
         finally:
@@ -323,10 +501,14 @@ class FurnitureEmbeddingPredictor(nn.Module):
                 if plt.fignum_exists(fig.number):
                     if train_batch_losses:
                         last_epoch = epoch if 'epoch' in locals() else epochs - 1
-                        _update_live_chart(last_epoch, train_batch_losses[-1])
-                        ax.set_title(
-                            f"Batch Training Loss - Completed {len(train_batch_losses)} Batches "
-                            f"(Final Loss: {train_batch_losses[-1]:.4f})"
+                        _update_live_chart(last_epoch, train_batch_losses[-1], train_batch_accs[-1])
+                        val_loss_str = f" | Val Loss: {val_losses[-1]:.4f}" if val_losses else ""
+                        val_acc_str = f" | Val Acc: {val_accs[-1]:.4f}" if val_accs else ""
+                        ax_loss.set_title(
+                            f"Loss - {len(train_batch_losses)} Batches | Final Train: {train_batch_losses[-1]:.4f}{val_loss_str}"
+                        )
+                        ax_acc.set_title(
+                            f"Accuracy - Final Train: {train_batch_accs[-1]:.4f}{val_acc_str}"
                         )
                     if is_notebook and display_handle is not None:
                         display_handle.update(fig)
@@ -349,6 +531,8 @@ class TransformerEvaluator:
         model: FurnitureEmbeddingPredictor,
         item_embeddings: dict[int, torch.Tensor] | torch.Tensor,
         item_ids: list[int] = None,
+        item_descriptions: list[str] = None,
+        return_strings: bool = False,
         aggregation: str = "confidence_weighted_max",
         filter_present: bool = True,
     ):
@@ -356,6 +540,8 @@ class TransformerEvaluator:
         self.model.eval()
         self.aggregation = aggregation
         self.filter_present = filter_present
+        self.item_descriptions = item_descriptions
+        self.return_strings = return_strings
 
         # Case 1: item_embeddings is a dictionary {item_id: Tensor(embed_dim)}
         if isinstance(item_embeddings, dict):
@@ -373,18 +559,28 @@ class TransformerEvaluator:
         else:
             raise TypeError("item_embeddings must be either a dict or a torch.Tensor")
 
+        if self.item_descriptions is not None:
+            self.desc_to_emb = {desc: emb for desc, emb in zip(self.item_descriptions, self.catalog_matrix)}
+
         # Pre-normalize catalog matrix once for fast cosine similarity dot products
         self.catalog_norm = F.normalize(self.catalog_matrix, p=2, dim=-1)
 
-    def predict(self, room: list[int], k: int = 1) -> list[int]:
+    def _get_item_emb(self, item):
+        if item in self.id_to_emb:
+            return self.id_to_emb[item]
+        if hasattr(self, 'desc_to_emb') and item in self.desc_to_emb:
+            return self.desc_to_emb[item]
+        raise KeyError(f"Item '{item}' not found in catalog embeddings.")
+
+    def predict(self, room: list, k: int = 1) -> list:
         if not room:
-            raise ValueError("room must contain at least one item ID")
+            raise ValueError("room must contain at least one item")
         if k < 1:
             raise ValueError("k must be at least 1")
 
         with torch.no_grad():
             # 1. Look up embeddings for the input room items (shape: 1, seq_len, embed_dim)
-            embedding = torch.stack([self.id_to_emb[item_id] for item_id in room], dim=0).unsqueeze(0).cpu()
+            embedding = torch.stack([self._get_item_emb(item) for item in room], dim=0).unsqueeze(0).cpu()
 
             # 2. Append mask token
             mask_token = self.model.mask_token.to(embedding.device)
@@ -401,6 +597,57 @@ class TransformerEvaluator:
             head_sims = torch.matmul(preds[0], self.catalog_norm.T)  # shape: (num_candidates, N)
 
             # 5. Aggregate candidate heads
+            if self.aggregation in ("interleaved", "sampled_interleaved"):
+                ranked_results = []
+                seen = set()
+                present_items = set(room) if self.filter_present else set()
+                num_heads = head_sims.shape[0]
+                max_fetch = min(head_sims.shape[1], k + len(present_items) + 5)
+                head_top_indices = {
+                    h: torch.topk(head_sims[h], k=max_fetch).indices.tolist()
+                    for h in range(num_heads)
+                }
+                pointers = {h: 0 for h in range(num_heads)}
+
+                def _pop_next_from_head(h: int) -> bool:
+                    indices_h = head_top_indices[h]
+                    while pointers[h] < len(indices_h):
+                        idx = indices_h[pointers[h]]
+                        pointers[h] += 1
+                        item_val = (
+                            self.item_descriptions[idx]
+                            if (self.return_strings and self.item_descriptions is not None)
+                            else self.item_ids[idx]
+                        )
+                        if item_val not in present_items and item_val not in seen:
+                            seen.add(item_val)
+                            ranked_results.append(item_val)
+                            return True
+                    return False
+
+                if self.aggregation == "interleaved":
+                    head_order = torch.argsort(probs, descending=True).tolist()
+                    while len(ranked_results) < k:
+                        added_any = False
+                        for h in head_order:
+                            if _pop_next_from_head(h):
+                                added_any = True
+                            if len(ranked_results) == k:
+                                break
+                        if not added_any:
+                            break
+                else:  # "sampled_interleaved"
+                    cat_dist = torch.distributions.Categorical(probs=probs)
+                    exhausted = set()
+                    while len(ranked_results) < k and len(exhausted) < num_heads:
+                        h = int(cat_dist.sample())
+                        if h in exhausted:
+                            continue
+                        if not _pop_next_from_head(h):
+                            exhausted.add(h)
+
+                return ranked_results
+
             if self.aggregation == "weighted":
                 sims = torch.matmul(probs, head_sims)
             elif self.aggregation == "confidence_weighted_max":
@@ -411,31 +658,31 @@ class TransformerEvaluator:
             # 6. Sort candidate indices descending
             rankings = torch.argsort(sims, descending=True)
 
-            # 7. Map row indices back to item IDs
-            ranked_ids = []
+            # 7. Map row indices back to item IDs or descriptions
+            ranked_results = []
             seen = set()
             present_items = set(room) if self.filter_present else set()
 
             for r in rankings:
                 idx = int(r)
-                predicted_id = self.item_ids[idx]
+                item_val = self.item_descriptions[idx] if (self.return_strings and self.item_descriptions is not None) else self.item_ids[idx]
 
-                if predicted_id not in present_items and predicted_id not in seen:
-                    seen.add(predicted_id)
-                    ranked_ids.append(predicted_id)
+                if item_val not in present_items and item_val not in seen:
+                    seen.add(item_val)
+                    ranked_results.append(item_val)
 
-                if len(ranked_ids) == k:
+                if len(ranked_results) == k:
                     break
 
-            return ranked_ids
+            return ranked_results
 
-    def predict_choices(self, room: list[int], k_per_head: int = 1) -> list[dict]:
+    def predict_choices(self, room: list, k_per_head: int = 1) -> list[dict]:
         """Returns predictions broken down by individual candidate head."""
         if not room:
-            raise ValueError("room must contain at least one item ID")
+            raise ValueError("room must contain at least one item")
 
         with torch.no_grad():
-            embedding = torch.stack([self.id_to_emb[item_id] for item_id in room], dim=0).unsqueeze(0).cpu()
+            embedding = torch.stack([self._get_item_emb(item_id) for item_id in room], dim=0).unsqueeze(0).cpu()
             mask_token = self.model.mask_token.to(embedding.device)
             embedding_masked = torch.cat([embedding, mask_token], dim=1)
             valid_mask = torch.ones((1, embedding_masked.shape[1]), dtype=torch.bool, device=embedding.device)
@@ -454,7 +701,7 @@ class TransformerEvaluator:
                 seen = set()
                 for r in rankings:
                     idx = int(r)
-                    iid = self.item_ids[idx]
+                    iid = self.item_descriptions[idx] if (self.return_strings and self.item_descriptions is not None) else self.item_ids[idx]
                     if iid not in present_items and iid not in seen:
                         seen.add(iid)
                         items.append(iid)

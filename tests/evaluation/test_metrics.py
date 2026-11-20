@@ -1,6 +1,7 @@
 import math
 import unittest
-from src.evaluation.metrics import recall_at_k, ndcg_at_k
+import torch
+from src.evaluation.metrics import recall_at_k, ndcg_at_k, semantic_recall_at_k
 
 
 class TestMetrics(unittest.TestCase):
@@ -38,6 +39,25 @@ class TestMetrics(unittest.TestCase):
     def test_ndcg_miss(self):
         """NDCG should return 0.0 when target is absent."""
         score = ndcg_at_k(self.predictions, target_item="item_z", k=5)
+        self.assertEqual(score, 0.0)
+
+    def test_semantic_recall_above_threshold(self):
+        """Semantic recall should return 1.0 when a top-k prediction meets threshold."""
+        emb_map = {
+            "item_a": torch.tensor([1.0, 0.0]),
+            "item_b": torch.tensor([0.9, 0.1]),
+            "target": torch.tensor([0.95, 0.05]),
+        }
+        score = semantic_recall_at_k(["item_a", "item_b"], "target", emb_map, k=2, threshold=0.95)
+        self.assertEqual(score, 1.0)
+
+    def test_semantic_recall_below_threshold(self):
+        """Semantic recall should return 0.0 when all top-k predictions are below threshold."""
+        emb_map = {
+            "item_a": torch.tensor([0.0, 1.0]),
+            "target": torch.tensor([1.0, 0.0]),
+        }
+        score = semantic_recall_at_k(["item_a"], "target", emb_map, k=1, threshold=0.85)
         self.assertEqual(score, 0.0)
 
 
