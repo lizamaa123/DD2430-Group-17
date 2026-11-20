@@ -4,12 +4,19 @@ data/synthetic_rooms.json, so the same RoomDataset and models can be used
 on both datasets:
 
     {"room_id": "DVD3HFDYEJI4OKYQBT3WKSY8",
-     "room_type": null,
+     "room_type": "bedroom",
+     "room_type_confidence": "high",
      "item_ids": [2880315, 2639579, 2823756, 3465459],
      "split": "train"}
 
 - room_id:   the DeepFurniture scene id (a string, unlike the synthetic ints).
-- room_type: None for now; DeepFurniture has no room types (to be labelled later).
+- room_type: the room type from room_labelling/run_room_labelling.py (Qwen
+             looking at the scene image). Labels below MIN_CONFIDENCE become
+             UNCERTAIN_ROOM_TYPE ("other"): checked by eye, those are mostly
+             views of a ceiling, a bare wall or an empty room. None if
+             ROOM_LABELS_PATH is None.
+- room_type_confidence: the model's own confidence ("high", "medium",
+             "low"), kept so the rule above can be changed later.
 - item_ids:  the scene's furniture ids as ints, the same keys as the embedding
              files from image_to_text/build_texts.py. Repeated identical items
              are kept, and all categories (doors, lamps, ...) are kept.
@@ -45,6 +52,15 @@ CAPTIONS_PATH = os.path.join(
     REPO_ROOT, "data", "deepfurniture", "image_to_text", "captions", "full_Qwen3.5-2B_full_v2.jsonl"
 )
 
+# The full run of room_labelling/run_room_labelling.py. None: room_type = None.
+ROOM_LABELS_PATH = os.path.join(
+    REPO_ROOT, "data", "deepfurniture", "room_labels", "labels", "full_Qwen3.5-2B_v1.jsonl"
+)
+# Labels with a lower confidence than this become UNCERTAIN_ROOM_TYPE.
+# "high" keeps only high-confidence labels, "low" keeps every label.
+MIN_CONFIDENCE = "high"
+UNCERTAIN_ROOM_TYPE = "other"
+
 # Same as room_generator.split_rooms.
 TRAIN_FRACTION = 0.8
 VAL_FRACTION = 0.1
@@ -69,13 +85,51 @@ def load_excluded_scenes(path):
         return {line for line in lines if line and not line.startswith("#")}
 
 
-def build_rooms(scene_items_path, excluded_scenes_path):
+CONFIDENCE_ORDER = ("low", "medium", "high")
+
+
+def load_room_labels(path, min_confidence=MIN_CONFIDENCE, uncertain_room_type=UNCERTAIN_ROOM_TYPE):
+    """
+    Room type per scene from a run_room_labelling.py output file.
+
+    Args:
+        path: The .jsonl label file (one record per scene; the last record
+            for a scene wins).
+        min_confidence: "low", "medium" or "high". Labels below it become
+            uncertain_room_type.
+        uncertain_room_type: Room type given to uncertain labels.
+
+    Returns:
+        Dict scene_id -> (room_type, model confidence).
+    """
+    labels = {}
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                if record["valid"]:
+                    labels[record["scene_id"]] = (record["room_type"], record["confidence"])
+
+    threshold = CONFIDENCE_ORDER.index(min_confidence)
+    changed = 0
+    for scene_id, (room_type, confidence) in labels.items():
+        if confidence not in CONFIDENCE_ORDER or CONFIDENCE_ORDER.index(confidence) < threshold:
+            if room_type != uncertain_room_type:
+                changed += 1
+            labels[scene_id] = (uncertain_room_type, confidence)
+    print(f"Room labels: {len(labels)}, below {min_confidence!r} confidence changed to "
+          f"{uncertain_room_type!r}: {changed}")
+    return labels
+
+
+def build_rooms(scene_items_path, excluded_scenes_path, room_labels=None):
     """
     One room per kept scene, without a split yet.
 
     Args:
         scene_items_path: DeepFurniture metadata/scene_items.json.
         excluded_scenes_path: The excluded-scenes .txt file.
+        room_labels: Output of load_room_labels, or None for room_type = None.
 
     Returns:
         List of room dicts, sorted by room_id.
@@ -88,9 +142,15 @@ def build_rooms(scene_items_path, excluded_scenes_path):
     for scene_id in sorted(scene_items):
         if scene_id in excluded:
             continue
+        room_type, confidence = None, None
+        if room_labels is not None:
+            if scene_id not in room_labels:
+                raise KeyError(f"Scene {scene_id} has no valid room label in the label file")
+            room_type, confidence = room_labels[scene_id]
         rooms.append({
             "room_id": scene_id,
-            "room_type": None,
+            "room_type": room_type,
+            "room_type_confidence": confidence,
             "item_ids": [int(item["furniture_id"]) for item in scene_items[scene_id]],
         })
 
@@ -143,6 +203,11 @@ def print_summary(rooms, captions_path=None):
     repeated = sum(len(set(room["item_ids"])) < len(room["item_ids"]) for room in rooms)
     print(f"Rooms with a repeated identical item: {repeated}")
 
+    room_types = Counter(room["room_type"] for room in rooms)
+    print("Room types:")
+    for room_type, count in room_types.most_common():
+        print(f"  {str(room_type):<14} {count:>6}  ({count / len(rooms):.1%})")
+
     if captions_path is None:
         return
     if not os.path.exists(captions_path):
@@ -163,7 +228,8 @@ def print_summary(rooms, captions_path=None):
 
 def main():
     """Run with the SETTINGS at the top of this file."""
-    rooms = build_rooms(SCENE_ITEMS_PATH, EXCLUDED_SCENES_PATH)
+    room_labels = load_room_labels(ROOM_LABELS_PATH) if ROOM_LABELS_PATH else None
+    rooms = build_rooms(SCENE_ITEMS_PATH, EXCLUDED_SCENES_PATH, room_labels)
     rooms = split_rooms(rooms)
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)

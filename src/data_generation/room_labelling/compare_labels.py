@@ -28,7 +28,7 @@ from src.data_generation.room_labelling.dataset import (  # noqa: E402
 # SETTINGS - change these before running
 # ===========================================================================
 
-LABELS_FILE = "pilot_Qwen3.5-2B_v1.jsonl"  # name in data/deepfurniture/room_labels/labels/
+LABELS_FILE = "full_Qwen3.5-2B_v1.jsonl"  # name in data/deepfurniture/room_labels/labels/
 HAND_LABELS_PATH = config.HAND_LABELS_PATH
 
 SHOW_MISTAKES = True  # open a window with the scenes where model and hand label differ
