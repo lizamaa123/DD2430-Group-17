@@ -538,6 +538,7 @@ class TransformerEvaluator:
         train_rooms: list[list] = None,
         item_counts: dict = None,
         pop_weight: float = 0.0,
+        room_type_embeddings: dict[str, torch.Tensor] = None,
     ):
         self.model = model.to("cpu")
         self.model.eval()
@@ -546,6 +547,11 @@ class TransformerEvaluator:
         self.item_descriptions = item_descriptions
         self.return_strings = return_strings
         self.pop_weight = pop_weight
+        self.room_type_embeddings = (
+            {k: v.cpu() for k, v in room_type_embeddings.items()}
+            if room_type_embeddings is not None
+            else None
+        )
 
         # Case 1: item_embeddings is a dictionary {item_id: Tensor(embed_dim)}
         if isinstance(item_embeddings, dict):
@@ -587,6 +593,11 @@ class TransformerEvaluator:
     def _get_item_emb(self, item):
         if item in self.id_to_emb:
             return self.id_to_emb[item]
+        if self.room_type_embeddings is not None:
+            if item in self.room_type_embeddings:
+                return self.room_type_embeddings[item]
+            if isinstance(item, str) and item.replace("_", " ") in self.room_type_embeddings:
+                return self.room_type_embeddings[item.replace("_", " ")]
         if hasattr(self, 'desc_to_emb') and item in self.desc_to_emb:
             return self.desc_to_emb[item]
         raise KeyError(f"Item '{item}' not found in catalog embeddings.")

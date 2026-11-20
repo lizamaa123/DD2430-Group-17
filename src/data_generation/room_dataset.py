@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 ROOMS_PATH = PROJECT_ROOT / "data" / "synthetic_rooms.json"
 EMBEDDINGS_PATH = PROJECT_ROOT / "data" / "item_embeddings.pt"
-ROOMS_PATH_DF = PROJECT_ROOT / "data" / "deepfurniture_rooms.json"
+ROOMS_PATH_DF = PROJECT_ROOT / "data" / "deepfurniture_rooms_labeled.json"
 EMBEDDINGS_PATH_DF_CAPTIONS = PROJECT_ROOT / "data" / "item_embeddings_caption_full_Qwen3.5-2B_full_v2.pt"
 EMBEDDINGS_PATH_DF_SHORT = PROJECT_ROOT / "data" / "item_embeddings_short_full_Qwen3.5-2B_full_v2.pt"
 
